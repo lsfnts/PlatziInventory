@@ -25,7 +25,7 @@ TIMEZONE="America/El_Salvador"       # e.g. America/New_York — see /usr/share/
 LANG_LOCALE="en_US.UTF-8"     # display/message language
 REGIONAL_LOCALE="es_SV.UTF-8" # date/currency/number formatting (El Salvador)
 REFLECTOR_COUNTRY="SV"       # two-letter country code for mirror selection
-TRUSTED_SSIDS=("Home-WiFi" "MyPhone-Hotspot")   # for the nftables zone script
+TRUSTED_SSIDS=("Acuario/5g" "Galaxy S23 4A5C")   # for the nftables zone script
 WIFI_IFACE="wlan0"           # confirm with `iwctl device list` before running
 # ============================================================
 
