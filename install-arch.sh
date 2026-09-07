@@ -309,7 +309,7 @@ echo "  -> Installing remaining packages"
 # -Syu, never -Sy: a plain refresh here means a partial upgrade later.
 pacman -Syu --noconfirm --needed \
     opendoas base-devel git tealdeer dash axel \
-    cryptsetup sbctl systemd-ukify openssl tpm2-tss tpm2-tools \
+    cryptsetup sbctl systemd-ukify sbsigntools openssl tpm2-tss tpm2-tools \
     iwd nftables \
     tlp zram-generator \
     pipewire pipewire-pulse pipewire-alsa wireplumber sof-firmware alsa-ucm-conf alsa-utils \
@@ -375,15 +375,18 @@ BOOSTER_EOF
 # attacker just edits the unsigned initramfs. The UKI seals kernel, initrd,
 # microcode AND the command line together.
 mkdir -p /etc/kernel /etc/kernel/secureboot
-# entry-token is pinned so kernel-install does not depend on /etc/machine-id,
-# which is not yet initialised inside the chroot.
 systemd-machine-id-setup
+# install.conf understands only BOOT_ROOT=, layout=, initrd_generator=,
+# uki_generator= and entry_name_format=. The entry token is NOT a key here —
+# it is its own file, or kernel-install warns "unknown key" and ignores it.
 cat > /etc/kernel/install.conf <<'KINSTALL_EOF'
 layout=uki
-entry-token=arch
 initrd_generator=booster
 uki_generator=ukify
 KINSTALL_EOF
+# Pinned so kernel-install does not fall back to /etc/machine-id, which is not
+# meaningfully initialised inside the chroot.
+echo arch > /etc/kernel/entry-token
 
 # Signed cmdline: rd.luks.uuid names the container, root= the filesystem
 # inside it. Neither can be edited without invalidating the signature.
@@ -395,6 +398,15 @@ CMDLINE_EOF
 # PCR 11 must be signed, not pinned: ukify re-signs it on every kernel build,
 # so kernel updates never need TPM re-enrollment.
 sbctl create-keys
+# ukify is pointed at these by absolute path below; if a future sbctl changes
+# the layout, catch it here instead of mid-build.
+for f in /var/lib/sbctl/keys/db/db.key /var/lib/sbctl/keys/db/db.pem; do
+    if [[ ! -f "$f" ]]; then
+        echo "  !! expected sbctl key $f is missing. Check 'ls -R /var/lib/sbctl/keys'" >&2
+        echo "     and fix the paths in /etc/kernel/uki.conf before continuing." >&2
+        exit 1
+    fi
+done
 openssl genpkey -algorithm rsa -pkeyopt rsa_keygen_bits:2048 -out /etc/kernel/pcr-private.pem
 openssl rsa -pubout -in /etc/kernel/pcr-private.pem -out /etc/kernel/pcr-public.pem
 chmod 0600 /etc/kernel/pcr-private.pem
@@ -490,6 +502,18 @@ LOADER_EOF
 /usr/local/bin/uki-rebuild
 # pacstrap's booster hook already produced a loose image; unsigned, now unused.
 rm -f /boot/booster-linux*.img
+
+# Fail loudly here rather than at the first reboot: without a UKI on the ESP
+# there is nothing for systemd-boot to find.
+shopt -s nullglob
+uki_built=(/boot/EFI/Linux/*.efi)
+if (( ${#uki_built[@]} == 0 )); then
+    echo "  !! No UKI was produced in /boot/EFI/Linux — the system will NOT boot." >&2
+    echo "     Re-run '/usr/local/bin/uki-rebuild' and read its output before rebooting." >&2
+    exit 1
+fi
+echo "  -> UKI(s): ${uki_built[*]}"
+shopt -u nullglob
 
 # Sign the loader itself, both the ESP copy and the /usr source that
 # systemd-boot-update.service later copies over it — signing only the ESP copy
