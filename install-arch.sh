@@ -210,7 +210,7 @@ echo "==> Step 4: Base install (pacstrap)"
 # linux-firmware-mediatek: the OmniBook 3's "Wi-Fi 6 2x2 + BT 5.4" card is a
 # MediaTek MT79xx on most HP SKUs; realtek is kept in case yours is an RTL8852.
 # Confirm with 'lspci -nnk | grep -A3 -i net' and drop the one you don't need.
-pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu linux-firmware-mediatek linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools micro
+pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools micro
 
 echo "==> Step 5: fstab + resolv.conf for network inside chroot"
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -620,10 +620,21 @@ cat > /etc/systemd/journald.conf.d/00-size.conf <<'JOURNALD_EOF'
 SystemMaxUse=200M
 JOURNALD_EOF
 
+echo "  -> makepkg: escalate through doas, not the sudo shim"
+# makepkg calls PACMAN_AUTH to install build deps. Left unset it looks for
+# sudo, and the /usr/local/bin/sudo -> doas symlink is not a faithful enough
+# stand-in (makepkg passes sudo-style flags doas rejects). Point it at doas
+# directly. No -n: that would break interactive `makepkg -si` later, once the
+# nopass policy below is reverted to `permit persist`.
+mkdir -p /etc/makepkg.conf.d
+cat > /etc/makepkg.conf.d/10-doas.conf <<'MAKEPKG_DOAS_EOF'
+PACMAN_AUTH=(doas)
+MAKEPKG_DOAS_EOF
+
 echo "  -> Building ashell from the AUR (status bar + notification daemon)"
-# ashell is AUR-only. makepkg refuses to run as root, and it shells out to
-# `sudo pacman` for deps — which is the doas symlink created above, so the
-# policy is relaxed to nopass for the duration of the build only.
+# ashell is AUR-only. makepkg refuses to run as root and escalates through
+# PACMAN_AUTH (doas, set above) to install build deps, so the policy is relaxed
+# to nopass for the duration of the build only.
 echo 'permit nopass :wheel' > /etc/doas.conf
 if runuser -l __USERNAME__ -c '
     set -euo pipefail
