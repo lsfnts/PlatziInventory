@@ -315,7 +315,7 @@ pacman -Syu --noconfirm --needed \
     pipewire pipewire-pulse pipewire-alsa wireplumber sof-firmware alsa-ucm-conf alsa-utils \
     bluez bluez-utils \
     mesa vulkan-radeon vulkan-mesa-layers \
-    scx-scheds \
+    scx-scheds scx-tools \
     hyprland ly xdg-desktop-portal-hyprland qt5-wayland qt6-wayland \
     hypridle hyprlock hyprpolkitagent \
     foot fuzzel yazi \
@@ -598,10 +598,14 @@ SYSCTL_EOF
 #   doas systemctl start bluetooth
 
 echo "  -> Login manager"
-systemctl enable ly
+# ly 1.x ships ONLY templated units (ly@.service, ly-kmsconvt@.service) — there
+# is no plain ly.service to enable. The instance name is the tty it owns.
+systemctl enable ly@tty2.service
 
 echo "  -> CPU scheduler service (enable only — pick a scheduler after first boot)"
-systemctl enable scx_loader
+# scx_loader.service lives in scx-tools, NOT scx-scheds (which is just the
+# scheduler binaries). scxctl is the CLI that talks to it.
+systemctl enable scx_loader.service
 
 echo "  -> Maintenance"
 sed -i "s/^Country = .*/Country = __REFLECTOR_COUNTRY__/" /etc/xdg/reflector/reflector.conf 2>/dev/null || true
