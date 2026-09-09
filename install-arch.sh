@@ -147,14 +147,56 @@ else
 fi
 
 echo "==> Step 1: Partitioning $DISK"
+# A previous, aborted run leaves the disk held: /mnt still mounted, the LUKS
+# mapper still open, maybe a swap file active. sgdisk then rewrites the table
+# but the kernel refuses to re-read it ("Warning: The kernel is still using the
+# old partition table"), and everything after this point operates on stale
+# device nodes. Release it all first — every step is a no-op on a clean disk.
+# Only this disk's swap, not the live environment's own (if any).
+while read -r sw _; do
+    case "$sw" in "$DISK"*|/mnt/*) swapoff "$sw" 2>/dev/null || true;; esac
+done < <(tail -n +2 /proc/swaps)
+umount -R /mnt 2>/dev/null || true
+for holder in /dev/mapper/root /dev/mapper/*; do
+    [[ -b "$holder" ]] || continue
+    case "$holder" in */control) continue;; esac
+    cryptsetup close "$(basename "$holder")" 2>/dev/null || true
+done
+udevadm settle
+# Still busy after that means something outside this script has it open —
+# say the live ISO auto-mounted a partition. Name it instead of failing later.
+if lsblk -nro MOUNTPOINT "$DISK" | grep -q .; then
+    echo "  !! $DISK still has mounted partitions:" >&2
+    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" >&2
+    echo "     Unmount them (or reboot the live USB) and re-run." >&2
+    exit 1
+fi
+
 sgdisk --zap-all "$DISK"
+# Belt and braces: zap-all clears the GPT/MBR structures but leaves other
+# filesystem/LUKS signatures in the first sectors, which blkid keeps reporting.
+wipefs -a "$DISK" >/dev/null
 # One signed UKI (kernel + lz4 booster initrd + microcode) is ~60M, and an
 # upgrade briefly holds two, so ~135M peak. Both sizes clear that; the 4Kn
 # value is a FAT32 cluster-count floor, not a capacity need.
 sgdisk -n1:0:+"$EFI_SIZE" -t1:ef00 -c1:"EFI" "$DISK"
 sgdisk -n2:0:0   -t2:8300 -c2:"root" "$DISK"
-partprobe "$DISK"
+# partprobe can still report the old table if a holder was released only
+# moments ago; blockdev --rereadpt is the harder hammer, and the loop gives
+# udev time to publish the new nodes before anything touches them.
+partprobe "$DISK" || blockdev --rereadpt "$DISK"
 udevadm settle
+for _ in $(seq 1 10); do
+    [[ -b "$EFI_PART" && -b "$ROOT_PART" ]] && break
+    sleep 1
+    udevadm settle
+done
+if [[ ! -b "$EFI_PART" || ! -b "$ROOT_PART" ]]; then
+    echo "  !! $EFI_PART / $ROOT_PART did not appear after re-reading the table." >&2
+    echo "     The kernel is still on the old partition table — reboot the live" >&2
+    echo "     USB and re-run; nothing has been written to the new layout yet." >&2
+    exit 1
+fi
 
 echo "==> Step 2: Formatting"
 mkfs.fat -F32 "$EFI_PART"
