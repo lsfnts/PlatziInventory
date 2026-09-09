@@ -4,7 +4,7 @@
 # Encodes: F2FS root (unencrypted, lz4 compression) · bare iwd + nftables
 # with a manual zone script · doas · dash as /bin/sh · TLP · mesa/vulkan-radeon
 # · scx-scheds · booster initramfs · Hyprland + ly · reflector/paccache/
-# fstrim/zram maintenance. No GTK anywhere: no GTK theme either.
+# fstrim/zswap maintenance. No GTK anywhere: no GTK theme either.
 #
 # Desktop: foot (terminal) · fuzzel (launcher) · ashell (status bar AND
 # notification daemon) · yazi (file manager) · Catppuccin Macchiato everywhere.
@@ -160,7 +160,7 @@ echo "==> Step 2: Formatting"
 mkfs.fat -F32 "$EFI_PART"
 
 # --- LUKS2 -------------------------------------------------------------
-# aes-xts-plain64/512 runs on Zen 5's VAES at several GB/s, so the cipher is
+# aes-xts-plain64/256 runs on Zen 5's VAES at several GB/s, so the cipher is
 # not the bottleneck; the settings that matter are:
 #   --sector-size 4096  match the drive's LBA size, or dm-crypt does a
 #                       read-modify-write per physical block
@@ -173,8 +173,8 @@ echo "    Set the LUKS passphrase. This is the RECOVERY credential: the TPM"
 echo "    will unlock the disk day to day, but if firmware changes invalidate"
 echo "    the TPM policy this passphrase is the only way back in."
 cryptsetup luksFormat --type luks2 \
-    --cipher aes-xts-plain64 --key-size 512 --pbkdf argon2id \
-    --sector-size 4096 --label archluks "$ROOT_PART"
+    --cipher aes-xts-plain64 --key-size 256 --pbkdf argon2id \
+    --sector-size 4096 --label archluks --iter-time 500 "$ROOT_PART"
 echo "    Unlocking it now:"
 cryptsetup open --persistent --allow-discards \
     --perf-no_read_workqueue --perf-no_write_workqueue "$ROOT_PART" root
@@ -210,7 +210,9 @@ echo "==> Step 4: Base install (pacstrap)"
 # linux-firmware-mediatek: the OmniBook 3's "Wi-Fi 6 2x2 + BT 5.4" card is a
 # MediaTek MT79xx on most HP SKUs; realtek is kept in case yours is an RTL8852.
 # Confirm with 'lspci -nnk | grep -A3 -i net' and drop the one you don't need.
-pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools micro
+# e2fsprogs is not part of 'base'; it is pulled in only for filefrag, which
+# reads the swap file's physical offset for resume_offset=.
+pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools e2fsprogs micro
 
 echo "==> Step 5: fstab + resolv.conf for network inside chroot"
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -311,7 +313,7 @@ pacman -Syu --noconfirm --needed \
     opendoas base-devel git tealdeer dash axel \
     cryptsetup sbctl systemd-ukify sbsigntools openssl tpm2-tss tpm2-tools \
     iwd nftables \
-    tlp zram-generator \
+    tlp earlyoom \
     pipewire pipewire-pulse pipewire-alsa wireplumber sof-firmware alsa-ucm-conf alsa-utils \
     bluez bluez-utils \
     mesa vulkan-radeon vulkan-mesa-layers \
@@ -388,10 +390,87 @@ KINSTALL_EOF
 # meaningfully initialised inside the chroot.
 echo arch > /etc/kernel/entry-token
 
+echo "  -> Swap file (backing store for zswap, and the hibernation target)"
+# zswap is a compressed RAM cache *in front of* a real swap device, so unlike
+# zram it needs one to exist. 8 GiB on 16 GiB of RAM: this is the ceiling on
+# how much anon memory can be pushed into the zswap pool, not disk that gets
+# written — with writeback disabled (below) pages that fail to compress are
+# rejected and stay resident instead of landing on the SSD.
+#
+# f2fs swap files must be pinned, and the order is mandated by the kernel
+# (fs/f2fs/data.c: "1) creat(), 2) ioctl(F2FS_IOC_SET_PIN_FILE), 3)
+# fallocate(2MB * N)"): pin the empty inode first so fallocate hands out one
+# aligned, contiguous, non-compressed extent. Getting it wrong is not fatal but
+# f2fs then logs "Swapfile is not align to section" and swapon fails.
+touch /swapfile
+chmod 600 /swapfile
+f2fs_io pinfile set /swapfile
+# Explicit, even though the kernel refuses to swapon a compressed inode: the
+# root fs runs with compress_extension=*, and a file with no extension is
+# exactly what that matches.
+f2fs_io setflags nocompression /swapfile
+# Plain fallocate is what the kernel's own message recommends; f2fs_io's
+# ioctl is the fallback if this f2fs build rejects it on a pinned inode.
+fallocate -l 8192M /swapfile || f2fs_io fallocate 0 0 8589934592 /swapfile
+mkswap /swapfile
+# Proven, not assumed: activate it here (the fs is really mounted) so a
+# pinning/alignment mistake surfaces now instead of as a silent no-swap boot.
+# genfstab ran before this file existed, so the entry is written by hand.
+RESUME_OFFSET=""
+if swapon /swapfile; then
+    swapoff /swapfile
+    echo '/swapfile none swap defaults,pri=100 0 0' >> /etc/fstab
+    # Hibernation needs the swap file's FIRST physical block, in PAGE_SIZE
+    # units — f2fs blocks are 4 KiB, so filefrag's value is used as-is. The
+    # file is pinned, so f2fs GC will never relocate it and this stays valid;
+    # recreating the swap file invalidates it and needs a UKI re-sign.
+    RESUME_OFFSET="$(filefrag -v /swapfile | awk '$1=="0:" {print substr($4, 1, length($4)-2)}')"
+    if [[ ! "$RESUME_OFFSET" =~ ^[0-9]+$ ]]; then
+        echo "  !! could not read the swap file offset — hibernation not wired." >&2
+        RESUME_OFFSET=""
+    fi
+else
+    echo "  !! swapon /swapfile failed — no fstab entry written." >&2
+    echo "     zswap needs a backing device; without one it does nothing," >&2
+    echo "     and hibernation has nowhere to write its image." >&2
+    echo "     Check 'dmesg | grep -i swapfile' for the f2fs alignment warning." >&2
+fi
+
+
 # Signed cmdline: rd.luks.uuid names the container, root= the filesystem
-# inside it. Neither can be edited without invalidating the signature.
-cat > /etc/kernel/cmdline <<'CMDLINE_EOF'
-rd.luks.uuid=__LUKS_UUID__ root=UUID=__ROOT_FS_UUID__ rootfstype=f2fs rootflags=__ROOT_MOUNT_OPTS__ rw
+# inside it. Neither can be edited without invalidating the signature — every
+# token here costs a re-sign to change, so this is deliberately short.
+#
+# nowatchdog: turns off the soft-lockup and NMI hard-lockup detectors. The
+# hard-lockup detector on this kernel is HARDLOCKUP_DETECTOR_PERF, i.e. it
+# permanently occupies one PMU counter per core; disabling it frees those for
+# perf/Godot profiling and removes a per-CPU periodic wakeup on battery.
+#
+# Deliberately NOT set (verified against Arch's config.x86_64):
+#   amd_pstate=active   X86_AMD_PSTATE_DEFAULT_MODE=3 is already ACTIVE
+#   preempt=full        CONFIG_PREEMPT=y + PREEMPT_DYNAMIC = full by default
+#   tsc=nowatchdog      already auto-disabled on Zen 5 (CONSTANT+NONSTOP TSC
+#                       + TSC_ADJUST, one package: arch/x86/kernel/tsc.c)
+#   amdgpu.dcfeaturemask PSR is on by default for DCN >= 3.1; this is 3.5
+#   iommu=pt            a few % on DMA-heavy I/O, but drops kernel DMA
+#                       isolation — wrong trade on a laptop built around LUKS
+#   mitigations=off     see arch-install-steps.md; security, not performance
+#   amdgpu.abmlevel=N   would LOCK panel power saving at boot: the driver only
+#                       lets userspace change it while it is -1/auto
+#
+# Hibernation: resume= names the same device as root= (the unlocked mapper, so
+# LUKS is opened first), resume_offset= the swap file's first physical block.
+# booster parses resume= and writes major:minor to /sys/power/resume BEFORE it
+# mounts root (init/main.go), which is the required order; resume_offset= is
+# consumed by the kernel's own __setup() and survives that write.
+# hibernate.compressor=lz4 replaces the built-in default of lzo — lz4
+# decompresses several times faster, and resume time is dominated by it.
+HIBERNATE_ARGS=""
+if [[ -n "$RESUME_OFFSET" ]]; then
+    HIBERNATE_ARGS=" resume=UUID=__ROOT_FS_UUID__ resume_offset=${RESUME_OFFSET} hibernate.compressor=lz4"
+fi
+cat > /etc/kernel/cmdline <<CMDLINE_EOF
+rd.luks.uuid=__LUKS_UUID__ root=UUID=__ROOT_FS_UUID__ rootfstype=f2fs rootflags=__ROOT_MOUNT_OPTS__ rw nowatchdog zswap.enabled=1 zswap.compressor=zstd zswap.max_pool_percent=25 zswap.shrinker_enabled=0${HIBERNATE_ARGS}
 CMDLINE_EOF
 
 # Secure Boot keys (sbctl) and the RSA pair that signs the PCR 11 policy.
@@ -569,29 +648,179 @@ systemctl enable tlp
 systemctl mask systemd-rfkill.service systemd-rfkill.socket 2>/dev/null || true
 systemctl mask power-profiles-daemon.service 2>/dev/null || true
 
-mkdir -p /etc/systemd
-# 8 GiB on 16 GiB of RAM. zram only allocates what it actually stores, and lz4
-# lands ~2.5-3x on anon pages, so 8 GiB of swap costs ~2.7-3.2 GiB of real RAM
-# at worst and buys ~+5 GiB of effective memory. Sizing it at full RAM is the
-# common mistake: the backing store is RAM, so an incompressible fill just
-# recreates the pressure it was meant to relieve, with zsmalloc overhead on top.
-cat > /etc/systemd/zram-generator.conf <<'ZRAM_EOF'
-[zram0]
-zram-size = min(ram / 2, 8192)
-compression-algorithm = lz4
-swap-priority = 100
-fs-type = swap
-ZRAM_EOF
+echo "  -> zswap: disable writeback everywhere (RAM-only, zram-like behaviour)"
+# Writeback is a per-cgroup property with no global module parameter
+# (mm/zswap.c exposes only enabled/compressor/max_pool_percent/
+# accept_threshold_percent/shrinker_enabled). The kernel resolves it
+# hierarchically, though — mem_cgroup_zswap_writeback_enabled() walks to the
+# root and returns false if ANY ancestor has it off — and memory.zswap.writeback
+# is one of the few memory.* files that exists on the ROOT cgroup (no
+# CFTYPE_NOT_ON_ROOT flag). So one write to the root covers every cgroup, now
+# and in the future, including anything systemd never manages.
+#
+# Done as a unit rather than tmpfiles because ordering matters: sysinit.target
+# is After=swap.target, so swap units are already active before
+# systemd-tmpfiles-setup runs. Before=swap.target closes that window.
+cat > /etc/systemd/system/zswap-disable-writeback.service <<'ZSWAP_UNIT_EOF'
+[Unit]
+Description=Disable zswap writeback for every cgroup
+DefaultDependencies=no
+Before=sysinit.target swap.target
+ConditionPathExists=/sys/fs/cgroup/memory.zswap.writeback
 
-# zram is RAM-speed with no seek penalty, so the defaults tuned for disk swap
-# are wrong: swap early and one page at a time, and give kswapd more headroom
-# so reclaim starts before allocation stalls.
-cat > /etc/sysctl.d/99-zram.conf <<'SYSCTL_EOF'
-vm.swappiness = 180
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh -c 'echo 0 > /sys/fs/cgroup/memory.zswap.writeback'
+
+[Install]
+WantedBy=sysinit.target
+ZSWAP_UNIT_EOF
+systemctl enable zswap-disable-writeback.service
+
+# Belt and braces: stop either manager writing 1 back into a unit's own knob.
+# DefaultMemoryZSwapWriteback= (systemd 261+) is parsed from the SAME table for
+# both managers (src/core/main.c parse_config_file), so one drop-in per manager
+# covers every unit type — no need for the six per-type files the AUR package
+# ships for older systemd.
+for scope in system user; do
+    mkdir -p "/etc/systemd/${scope}.conf.d"
+    cat > "/etc/systemd/${scope}.conf.d/zswap-disable-writeback.conf" <<'ZSWAP_MGR_EOF'
+[Manager]
+DefaultMemoryZSwapWriteback=no
+ZSWAP_MGR_EOF
+done
+
+# Reads come out of the compressed pool in RAM, not off the SSD, so the
+# defaults tuned for disk swap are wrong: swap early, one page at a time, and
+# give kswapd headroom so reclaim starts before allocation stalls.
+cat > /etc/sysctl.d/99-swap.conf <<'SYSCTL_EOF'
+vm.swappiness = 120
 vm.page-cluster = 0
-vm.watermark_boost_factor = 0
-vm.watermark_scale_factor = 125
 SYSCTL_EOF
+
+echo "  -> Network sysctls"
+# Deliberately no tcp_rmem/tcp_wmem/rmem_max pinning: the kernel autotunes
+# tcp_rmem[2] far above the usual copy-pasted 16 MiB on a 16 GiB box, and the
+# BDP here is ~1.25 MB (100 Mbps x 100 ms cafe Wi-Fi), ~7.5 MB even on a
+# 300 Mbps/200 ms transatlantic path. Receive-buffer tuning is a 10-100 GbE
+# concern. Check with: sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_max
+cat > /etc/sysctl.d/90-net-local.conf <<'NETCTL_EOF'
+# PMTU black-hole recovery: captive portals, PPPoE, VPN/WireGuard overhead.
+# Kernel default is 0 (disabled); 1 = enable only once a black hole is detected.
+net.ipv4.tcp_mtu_probing = 1
+
+# Don't collapse cwnd after an idle RTO - helps long-lived HTTP/2, SSH, mosh.
+# Kernel default is 1 (enabled).
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Cap unsent bytes in the write queue: lower latency for interactive/upload-heavy
+# apps (video calls, screen sharing). 128 KiB is Google's recommended value.
+net.ipv4.tcp_notsent_lowat = 131072
+
+# IPv6 privacy extensions: kernel default is 0 = OFF for most devices.
+# 2 = enable and *prefer* temporary addresses.
+net.ipv6.conf.all.use_tempaddr = 2
+net.ipv6.conf.default.use_tempaddr = 2
+
+# Hostile-LAN hygiene (cafe). Redirect acceptance defaults to on for hosts.
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+NETCTL_EOF
+
+echo "  -> OOM handling (earlyoom)"
+# Why earlyoom and not systemd-oomd, which is already installed: oomd kills a
+# whole CGROUP. Hyprland is started straight from ly, so every application
+# lives in one session-N.scope — an oomd kill would take the entire desktop
+# with it. Per-app cgroups (uwsm, app-*.slice) would change that answer.
+# earlyoom kills one process by badness instead, and polls /proc/meminfo on an
+# adaptive 100-1000 ms sleep (1 s while memory is plentiful, i.e. always on
+# battery), which is a rounding error next to the panel.
+#
+# This matters more than it would with plain disk swap: with zswap writeback
+# disabled the SSD is never written, so when the pool and the swap slots are
+# full the kernel simply cannot reclaim anon memory any further
+# (mm/page_io.c returns AOP_WRITEPAGE_ACTIVATE and the page stays resident).
+# The failure mode is a hard wall, not a slow thrash you can notice and react
+# to — which is exactly the case a userspace OOM killer exists for.
+#
+# -r 0    no periodic memory report: kills are still logged, but an idle
+#         laptop does not wake journald once an hour to write a stat line.
+# -m/-s   percentages of MemAvailable / SwapFree; both must be under the
+#         threshold before earlyoom acts. SwapFree is a good zswap gauge here
+#         because a stored page holds its swap slot even though nothing is
+#         written to disk.
+# --avoid the session's own infrastructure: killing these logs you out and
+#         costs more than the process that actually leaked.
+# --prefer browser content processes: the usual memory hogs next to Godot, and
+#         the cheapest thing on the machine to lose.
+# No quotes inside EARLYOOM_ARGS: the unit passes it unquoted through systemd
+# word splitting, so a quote would end up inside the regex and match nothing.
+# The regexes are matched against /proc/PID/comm (kill.c: get_comm), which the
+# kernel truncates to 15 characters — hence "Isolated Web Co" (Firefox content,
+# exactly 15) and "WebKitWebProces" with no trailing s.
+cat > /etc/default/earlyoom <<'EARLYOOM_EOF'
+EARLYOOM_ARGS=-r 0 -m 5,3 -s 5,2 --avoid ^(Hyprland|ashell|hypridle|ly|systemd|dbus-.*)$ --prefer ^(firefox|chrom(e|ium)|electron|Isolated[[:space:]]Web[[:space:]]Co|WebKitWebProces|steam.*)$
+EARLYOOM_EOF
+systemctl enable earlyoom.service
+
+echo "  -> Panel power saving (amdgpu ABM) on battery only"
+# The 300-nit eDP panel is the single largest consumer on this machine. amdgpu
+# exposes Adaptive Backlight Management per eDP connector as
+# /sys/class/drm/card*-eDP-*/amdgpu/panel_power_savings (0-4, larger = dimmer
+# and less colour-accurate). It is NOT set via amdgpu.abmlevel=: that module
+# param locks the level for the whole boot, and the driver only accepts
+# userspace writes while it is left at -1/auto.
+cat > /usr/local/bin/panel-power-savings <<'PPS_EOF'
+#!/bin/bash
+# panel-power-savings [0-4|auto]
+# auto: LEVEL_ON_BAT while discharging, 0 on AC.
+# Colour accuracy matters for art work, so AC is always level 0. Drop
+# LEVEL_ON_BAT to 1 if the shift bothers you on battery too, 0 to disable.
+set -uo pipefail
+LEVEL_ON_BAT=2
+
+level="${1:-auto}"
+if [[ "$level" == auto ]]; then
+    level="$LEVEL_ON_BAT"
+    for ac in /sys/class/power_supply/*/type; do
+        [[ "$(< "$ac")" == Mains ]] || continue
+        [[ "$(< "${ac%/type}/online")" == 1 ]] && level=0
+    done
+fi
+
+shopt -s nullglob
+for f in /sys/class/drm/card*-eDP-*/amdgpu/panel_power_savings; do
+    # Writing this file forces a modeset, so never write the same value twice.
+    [[ "$(< "$f")" == "$level" ]] && continue
+    echo "$level" > "$f" || true
+done
+PPS_EOF
+chmod 755 /usr/local/bin/panel-power-savings
+
+cat > /etc/udev/rules.d/95-panel-power-savings.rules <<'PPS_UDEV_EOF'
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Mains", RUN+="/usr/local/bin/panel-power-savings auto"
+PPS_UDEV_EOF
+
+# udev only sees plug/unplug transitions, so the initial state is applied once
+# at boot. The eDP connector exists as soon as amdgpu has modeset, which is
+# well before multi-user.target.
+cat > /etc/systemd/system/panel-power-savings.service <<'PPS_UNIT_EOF'
+[Unit]
+Description=Apply amdgpu panel power saving for the current power source
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/panel-power-savings auto
+
+[Install]
+WantedBy=multi-user.target
+PPS_UNIT_EOF
+systemctl enable panel-power-savings.service
 
 # Bluetooth is installed but NOT enabled: an idle controller is a constant
 # small draw and a wakeup source. Start it when you need it:
@@ -667,7 +896,9 @@ if [[ $EUID -ne 0 ]]; then echo "run as root (doas $0)" >&2; exit 1; fi
 echo "== current state =="
 sbctl status
 
-if ! sbctl status | grep -q "Setup Mode:.*Enabled"; then
+# Parsed from --json, not from the human table: that output is colourised and
+# its wording is not an API.
+if [[ "$(sbctl status --json | jq -r .setup_mode)" != true ]]; then
     echo
     echo "Firmware is NOT in setup mode. Reboot into the BIOS, erase the"
     echo "Secure Boot keys, then run this again." >&2
@@ -680,10 +911,20 @@ fi
 sbctl enroll-keys -m
 
 echo "== verifying every EFI binary on the ESP is signed =="
-sbctl verify
+# Gate on the exit status: an unsigned binary here means the next boot with
+# Secure Boot enabled fails, and that is much better caught now.
+if ! sbctl verify; then
+    echo
+    echo "Something on the ESP is NOT signed by your keys. Do NOT enable Secure" >&2
+    echo "Boot yet. Sign the UKI with 'doas uki-rebuild', sign the loader with" >&2
+    echo "  doas sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI" >&2
+    echo "  doas sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi" >&2
+    echo "then re-run 'sbctl verify' until every line is signed." >&2
+    exit 1
+fi
 
 echo
-echo "All green? Reboot, enable Secure Boot in the BIOS, and confirm with"
+echo "All green. Reboot, enable Secure Boot in the BIOS, and confirm with"
 echo "  sbctl status        (Secure Boot: Enabled)"
 echo "Then run: doas tpm-autounlock"
 SBENROLL_EOF
@@ -702,8 +943,40 @@ LUKS_DEV="$(blkid -t TYPE=crypto_LUKS -o device | head -n1)"
 [[ -b "$LUKS_DEV" ]] || { echo "no LUKS device found" >&2; exit 1; }
 echo "LUKS device: $LUKS_DEV"
 
-if ! sbctl status | grep -q "Secure Boot:.*Enabled"; then
-    echo "Secure Boot is not enabled yet — run secureboot-enroll first." >&2
+if [[ "$(sbctl status --json | jq -r .secure_boot)" != true ]]; then
+    echo "Secure Boot is not enabled yet — run secureboot-enroll first, then" >&2
+    echo "enable Secure Boot in the BIOS and boot back in." >&2
+    exit 1
+fi
+
+# The signed-PCR-11 policy only works if the UKI actually carries a .pcrsig
+# section: at boot systemd-stub unpacks it to /.extra/tpm2-pcr-signature.json
+# inside the initramfs, which is where booster reads it. That path is gone by
+# the time this script runs (booster is not a systemd initrd and does not copy
+# it to /run), so the signature is pulled straight out of the running kernel's
+# own image instead — both as the existence check and, below, as
+# systemd-cryptenroll's safety net.
+UKI="/boot/EFI/Linux/arch-$(uname -r).efi"
+if [[ ! -f "$UKI" ]]; then
+    shopt -s nullglob
+    ukis=(/boot/EFI/Linux/*.efi)
+    shopt -u nullglob
+    (( ${#ukis[@]} == 1 )) && UKI="${ukis[0]}"
+fi
+if [[ ! -f "$UKI" ]]; then
+    echo "Cannot identify the running UKI in /boot/EFI/Linux." >&2
+    echo "Run 'doas uki-rebuild', reboot, then re-run this." >&2
+    exit 1
+fi
+echo "UKI: $UKI"
+
+PCRSIG="$(mktemp)"
+trap 'rm -f "$PCRSIG"' EXIT
+if ! objcopy -O binary --only-section=.pcrsig "$UKI" "$PCRSIG" 2>/dev/null || [[ ! -s "$PCRSIG" ]]; then
+    echo "$UKI carries no .pcrsig section — it was built without a signed PCR" >&2
+    echo "policy, and the enrolled token could never be satisfied. Check" >&2
+    echo "[PCRSignature:initrd] in /etc/kernel/uki.conf, run 'doas uki-rebuild'," >&2
+    echo "reboot, then re-run this." >&2
     exit 1
 fi
 
@@ -712,16 +985,27 @@ fi
 #          kernel update re-signs it and needs no re-enrollment
 # PCR 15 : all-zero latch, booster extends it after unlocking so a second
 #          "supplanted" volume cannot re-unseal the same key
-systemd-cryptenroll --tpm2-device=auto \
+# --wipe-slot=tpm2 makes this idempotent: re-running after a firmware update
+# replaces the old token instead of stacking a second, stale one.
+# --tpm2-signature= is systemd-cryptenroll's safety net: it replays the policy
+# against the CURRENT PCR state before writing the slot and refuses if the
+# combination would not actually unlock. Without it "no such verification is
+# done" (systemd-cryptenroll(1)) — and the file it would otherwise look for,
+# /run/systemd/tpm2-pcr-signature.json, only exists under a systemd initrd.
+systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
     --tpm2-pcrs=7+15:sha256=0000000000000000000000000000000000000000000000000000000000000000 \
     --tpm2-public-key=/etc/kernel/pcr-public.pem --tpm2-public-key-pcrs=11 \
+    --tpm2-signature="$PCRSIG" \
     "$LUKS_DEV"
+
+echo "== enrolled tokens =="
+cryptsetup luksDump "$LUKS_DEV" | grep -A2 -E "^Tokens:|systemd-tpm2" || true
 
 echo
 echo "Enrolled. The passphrase keyslot is untouched and remains your recovery"
 echo "path. Reboot to confirm the disk unlocks with no prompt."
-echo "If firmware changes ever break it: enter the passphrase, then re-run"
-echo "this script (systemd-cryptenroll --wipe-slot=tpm2 first)."
+echo "If a firmware update ever breaks it: enter the passphrase and just"
+echo "re-run this script — it wipes the old tpm2 slot before enrolling."
 TPMENROLL_EOF
 chmod 755 /usr/local/bin/tpm-autounlock
 
@@ -1175,7 +1459,12 @@ echo "==> Step 12: Handing DNS over to systemd-resolved"
 # Done last: everything above (pacman, reflector, makepkg, ya) needed the
 # live environment's resolv.conf, and the stub file only exists once
 # systemd-resolved is actually running on the installed system.
-arch-chroot /mnt ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+#
+# NOT via arch-chroot: it bind-mounts the host's /etc/resolv.conf over the
+# chroot's for the duration of each invocation, so replacing the file from
+# inside fails with EBUSY ("Device or resource busy"). Outside the chroot the
+# bind mount is gone and it is an ordinary file.
+ln -sfn /run/systemd/resolve/stub-resolv.conf /mnt/etc/resolv.conf
 
 echo "=================================================================="
 echo "  DISK IS ENCRYPTED — finish the Secure Boot / TPM2 bring-up first"
