@@ -237,11 +237,58 @@ SSID="$1"
 IFACE="__IFACE__"
 TRUSTED_NETWORKS=(__TRUSTED_NETWORKS__)
 
+# The configured name is a guess made at install time; if it is wrong, take the
+# first interface the kernel reports as wireless instead of failing obscurely.
+if [[ ! -d "/sys/class/net/$IFACE/wireless" ]]; then
+    for cand in /sys/class/net/*/wireless; do
+        IFACE="$(basename "$(dirname "$cand")")"
+        break
+    done
+    if [[ ! -d "/sys/class/net/$IFACE/wireless" ]]; then
+        echo "No wireless interface found. 'ip link' to check, and 'lspci -nnk | grep -A3 -i net'" >&2
+        echo "to confirm the right linux-firmware-* package is installed." >&2
+        exit 1
+    fi
+    echo "note: using interface $IFACE"
+fi
+
+# iwd resolves 'connect <name>' against what it has actually seen. A cold
+# station has an empty network list, and iwctl then fails with "Invalid network
+# name" — which reads like a typo but only means "not scanned yet". So: power
+# the device up, force a scan, and wait for the SSID to appear.
+doas iwctl device "$IFACE" set-property Powered on >/dev/null 2>&1 || true
+doas iwctl device "$IFACE" set-property Mode station >/dev/null 2>&1 || true
+
+seen_ssid() {
+    # get-networks draws a table with ANSI colour; strip it before matching.
+    iwctl station "$IFACE" get-networks 2>/dev/null \
+        | sed -e 's/\x1b\[[0-9;]*m//g' \
+        | grep -Fq -- "$SSID"
+}
+
+if ! seen_ssid; then
+    echo "Scanning for '$SSID'..."
+    doas iwctl station "$IFACE" scan >/dev/null 2>&1 || true
+    for _ in $(seq 1 15); do
+        sleep 1
+        seen_ssid && break
+    done
+fi
+
 # Drop to untrusted first: if the connect fails we stay closed.
 doas nft flush set inet filter trusted_tcp_ports
 doas nft flush set inet filter trusted_udp_ports
 
-iwctl station "$IFACE" connect "$SSID"
+if seen_ssid; then
+    iwctl station "$IFACE" connect "$SSID"
+else
+    # Not broadcast after a full scan: either hidden, or out of range. iwd needs
+    # a different verb for hidden networks.
+    echo "'$SSID' is not in the scan results — trying it as a hidden network."
+    echo "If that is wrong, check the exact name (it is case sensitive) with:"
+    echo "  iwctl station $IFACE get-networks"
+    iwctl station "$IFACE" connect-hidden "$SSID"
+fi
 
 for net in "${TRUSTED_NETWORKS[@]}"; do
   if [[ "$SSID" == "$net" ]]; then
@@ -306,6 +353,46 @@ echo "==> Step 8: Writing chroot setup script"
 cat <<'CHROOT_EOF' > /mnt/root/chroot-setup.sh
 #!/bin/bash
 set -euo pipefail
+
+echo "  -> CachyOS optimized repositories (Zen 4/5 -> znver4)"
+# Ryzen AI 5 340 is Zen 5, so gcc reports -march=znver5 and CachyOS's own
+# probe (check_supported_znver45) selects its Zen4+ repo set:
+#   [cachyos-znver4] [cachyos-core-znver4] [cachyos-extra-znver4]
+# all served from /etc/pacman.d/cachyos-v4-mirrorlist, plus plain [cachyos].
+# Those are x86-64-v4 (AVX-512) builds plus the Zen4/5-only instructions.
+#
+# Done BEFORE the package install below so the whole desktop stack is pulled
+# already optimized; the pacstrap'd base stays generic (see the note printed
+# at the end of the install for how to migrate it).
+#
+# Upstream's script is used rather than hand-written repo stanzas because it
+# also installs the CachyOS keyring and their patched pacman, which is what
+# understands the x86_64_v4/znver4 package architectures ("Architecture = auto").
+# Its own package URLs are version-pinned inside the tarball, so fetching the
+# tarball fresh is the only way to avoid them rotting.
+#
+# gcc (base-devel) is required for the znver probe and gawk for the pacman.conf
+# rewrite; without gcc the script silently falls back to the plain v4 repos.
+pacman -Syu --noconfirm --needed base-devel gawk curl gnupg
+cachy_ok=0
+if curl -fsSL https://mirror.cachyos.org/cachyos-repo.tar.xz -o /tmp/cachyos-repo.tar.xz &&
+   tar -xf /tmp/cachyos-repo.tar.xz -C /tmp &&
+   ( cd /tmp/cachyos-repo && ./cachyos-repo.sh --install ); then
+    cachy_ok=1
+fi
+if (( cachy_ok )); then
+    if grep -q '^\[cachyos-znver4\]' /etc/pacman.conf; then
+        echo "  -> znver4 repos active"
+    else
+        echo "  !! CachyOS repos added, but NOT the znver4 set — the CPU probe"
+        echo "     picked a lower tier. Check: gcc -march=native -Q --help=target | grep march="
+    fi
+else
+    echo "  !! CachyOS repo setup failed — continuing with stock Arch packages." >&2
+    echo "     Re-run later: curl https://mirror.cachyos.org/cachyos-repo.tar.xz | tar xJ" >&2
+    echo "     && cd cachyos-repo && doas ./cachyos-repo.sh" >&2
+fi
+rm -rf /tmp/cachyos-repo /tmp/cachyos-repo.tar.xz
 
 echo "  -> Installing remaining packages"
 # -Syu, never -Sy: a plain refresh here means a partial upgrade later.
@@ -579,8 +666,15 @@ LOADER_EOF
 # uname -r inside a chroot is the LIVE ISO's kernel, so iterate the modules
 # tree instead of trusting it.
 /usr/local/bin/uki-rebuild
-# pacstrap's booster hook already produced a loose image; unsigned, now unused.
-rm -f /boot/booster-linux*.img
+# pacstrap's booster hook already ran once, before its hook was masked above.
+# Its script (usr/share/libalpm/scripts/booster-install) does two things:
+#   install -Dm644 "$kernel/vmlinuz" /boot/vmlinuz-$pkgbase
+#   booster build /boot/booster-linux.img
+# /boot IS the ESP here, so both land on it: an unsigned kernel image and an
+# unsigned initramfs that nothing boots (the UKI bundles its own copies from
+# /usr/lib/modules). Left in place they are dead weight that 'sbctl verify'
+# reports as unsigned forever.
+rm -f /boot/booster-linux*.img /boot/vmlinuz-*
 
 # Fail loudly here rather than at the first reboot: without a UKI on the ESP
 # there is nothing for systemd-boot to find.
@@ -911,15 +1005,23 @@ fi
 sbctl enroll-keys -m
 
 echo "== verifying every EFI binary on the ESP is signed =="
-# Gate on the exit status: an unsigned binary here means the next boot with
-# Secure Boot enabled fails, and that is much better caught now.
-if ! sbctl verify; then
+sbctl verify || true
+# The exit status is useless as a gate: cmd/sbctl/verify.go returns nil even
+# when it printed "is not signed" for every file. Read the JSON instead.
+# is_signed: 1 signed, 0 unsigned, -1 file missing (a stale database entry,
+# not a boot problem).
+unsigned="$(sbctl verify --json | jq -r '.[] | select(.is_signed == 0) | .file_name')"
+if [[ -n "$unsigned" ]]; then
     echo
-    echo "Something on the ESP is NOT signed by your keys. Do NOT enable Secure" >&2
-    echo "Boot yet. Sign the UKI with 'doas uki-rebuild', sign the loader with" >&2
-    echo "  doas sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI" >&2
-    echo "  doas sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi" >&2
-    echo "then re-run 'sbctl verify' until every line is signed." >&2
+    echo "These files on the ESP are NOT signed by your keys:" >&2
+    printf '  %s\n' $unsigned >&2
+    echo >&2
+    echo "Do NOT enable Secure Boot yet — the firmware would refuse to boot" >&2
+    echo "anything unsigned in the boot path. Fix, then re-run this script:" >&2
+    echo "  *.efi in /boot/EFI/Linux   -> doas uki-rebuild" >&2
+    echo "  the loader                 -> doas sbctl sign -s <path>" >&2
+    echo "  /boot/vmlinuz-* or *.img   -> leftovers from booster's pacman hook," >&2
+    echo "                                nothing boots them: doas rm <path>" >&2
     exit 1
 fi
 
@@ -1305,7 +1407,9 @@ blink=no
 hide-when-typing=yes
 
 # Catppuccin Macchiato
-[colors]
+# foot >= 1.17 split the old [colors] section into [colors-dark] and
+# [colors-light] and rejects the old name outright; dark is the default theme.
+[colors-dark]
 alpha=1.0
 foreground=cad3f5
 background=24273a
@@ -1494,8 +1598,12 @@ echo "     makepkg). After first login: git clone https://aur.archlinux.org/paru
 echo "     && cd paru && makepkg -si  (uses your doas symlink automatically)"
 echo ""
 echo "  2. CPU scheduler: scx_loader is enabled but no scheduler is chosen."
-echo "     After first boot: check 'scx_loader --help' for the current"
-echo "     syntax, then switch to scx_lavd."
+echo "     After first boot: 'scxctl --help', then switch to scx_lavd."
+echo ""
+echo "  2b. CachyOS znver4 repos are enabled, but only packages installed"
+echo "      AFTER that point are optimized builds. To migrate the pacstrap'd"
+echo "      base too (a full re-download of every native package):"
+echo "        doas pacman -Syu && pacman -Qqn | doas pacman -S -"
 echo ""
 echo "  3. Connect Wi-Fi with: wifi-connect \"YourSSID\" (not raw iwctl) so"
 echo "     the nftables trust zone gets set correctly."
