@@ -12,7 +12,7 @@
 # reflector/paccache/fstrim maintenance. No GTK anywhere: no GTK theme either.
 #
 # Desktop: foot (terminal) · fuzzel (launcher) · ashell (status bar AND
-# notification daemon) · yazi (file manager) · Catppuccin Macchiato everywhere.
+# notification daemon) · yazi (file manager) · Catppuccin Frappé everywhere.
 # The session is a set of systemd user units, not a process tree: uwsm starts
 # the compositor and its daemons, runapp starts applications into
 # app-graphical.slice, and systemd-oomd kills one of those instead of the
@@ -41,7 +41,6 @@ USERNAME="luis"
 TIMEZONE="America/El_Salvador"       # e.g. America/New_York — see /usr/share/zoneinfo
 LANG_LOCALE="en_US.UTF-8"     # display/message language
 REGIONAL_LOCALE="es_SV.UTF-8" # date/currency/number formatting (El Salvador)
-REFLECTOR_COUNTRIES="US,MX,CO"
 CONSOLE_KEYMAP="la-latin1"
 KB_LAYOUT="latam"
 # Hibernation swap file, in MiB. Not the primary swap device (zram is), so
@@ -323,6 +322,19 @@ mount -o "$ROOT_MOUNT_OPTS" "$ROOT_DEV" /mnt
 mount --mkdir -o fmask=0077,dmask=0077 "$EFI_PART" /mnt/boot
 
 echo "==> Step 4: Base install (pacstrap)"
+# Rank the LIVE environment's mirrors before pacstrap ever reads them, with
+# the exact settings the "Maintenance" step below later bakes into the
+# installed system's own reflector.conf/timer —  https, the 12
+# freshest, sorted by rate. pacstrap fetches every package through the ISO's
+# pacman/mirrorlist, so this is what actually speeds pacstrap up; reflector
+# is on the ISO by default, but nothing forces that, so check first.
+if command -v reflector >/dev/null 2>&1; then
+    reflector --age 12 --protocol https --latest 12 --sort rate \
+        --save /etc/pacman.d/mirrorlist \
+        || echo "  !! reflector failed here — pacstrap falls back to the ISO's mirrorlist"
+else
+    echo "  -> reflector not found on this ISO — pacstrap uses its shipped mirrorlist"
+fi
 # The OmniBook 3's "Wi-Fi 6 2x2 + BT 5.4" card is an RTL8852.
 # e2fsprogs is only here for filefrag, which reads the swap file's physical
 # offset for resume_offset=. dash has to land here, not in chroot-setup.sh's
@@ -1622,6 +1634,36 @@ grep -q '^waylandsessions = /etc/ly/wayland-sessions$' /etc/ly/config.ini || {
     echo "     by hand, or the greeter will also offer the non-uwsm session."
 }
 
+echo "  -> Login screen animation"
+# ly's built-in 'dur_file' animation plays a durdraw movie (JSON: one or more
+# frames of ASCII/ANSI art plus a per-cell 256-color map, cmang/durdraw) right
+# on its own tty, before plymouth hands off and before Hyprland ever starts —
+# nothing else in this setup touches it. It needs full_color = true to draw a
+# 256-color movie at all, which is ly's packaged default, so that key is
+# reasserted here rather than trusted silently.
+#
+ANIMATION_URL="https://raw.githubusercontent.com/lsfnts/PlatziInventory/master/animation.dur"
+if curl -fsSL --max-time 60 "$ANIMATION_URL" -o /etc/ly/animation.dur; then
+    sed -i \
+        -e 's|^animation = .*|animation = dur_file|' \
+        -e 's|^dur_file_path = .*|dur_file_path = /etc/ly/animation.dur|' \
+        -e 's|^full_color = .*|full_color = true|' \
+        /etc/ly/config.ini
+    grep -q '^animation = dur_file$' /etc/ly/config.ini || {
+        echo "  !! ly's config.ini did not take the animation edit. Set"
+        echo "     'animation = dur_file' and"
+        echo "     'dur_file_path = /etc/ly/animation.dur' in /etc/ly/config.ini"
+        echo "     by hand."
+    }
+else
+    rm -f /etc/ly/animation.dur
+    echo "  !! Could not fetch animation.dur from $ANIMATION_URL — skipping." >&2
+    echo "     ly's greeter stays on 'animation = none'. Re-run later with:" >&2
+    echo "       doas curl -fsSL '$ANIMATION_URL' -o /etc/ly/animation.dur" >&2
+    echo "     then set animation = dur_file and" >&2
+    echo "     dur_file_path = /etc/ly/animation.dur in /etc/ly/config.ini." >&2
+fi
+
 echo "  -> CPU scheduler (scx_lavd via scx_loader)"
 # scx_loader.service lives in scx-tools, NOT scx-scheds (which is just the
 # scheduler binaries — both are pulled in above). scxctl is the CLI that
@@ -1659,11 +1701,11 @@ mkdir -p /etc/xdg/reflector
 cat > /etc/xdg/reflector/reflector.conf <<REFLECTOR_EOF
 --save /etc/pacman.d/mirrorlist
 --protocol https
---country __REFLECTOR_COUNTRIES__
---latest 10
+--age 12
+--latest 12
 --sort rate
 REFLECTOR_EOF
-reflector --country __REFLECTOR_COUNTRIES__ --protocol https --latest 10 --sort rate \
+reflector --age 12 --protocol https --latest 12 --sort rate \
     --save /etc/pacman.d/mirrorlist \
     || echo "reflector failed — check network, you can re-run it after first boot"
 systemctl enable reflector.timer
@@ -2044,7 +2086,6 @@ sed -i "s|__USERNAME__|${USERNAME}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__ROOT_MOUNT_OPTS__|${ROOT_MOUNT_OPTS}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__LUKS_UUID__|${LUKS_UUID}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__ROOT_FS_UUID__|${ROOT_FS_UUID}|g" /mnt/root/chroot-setup.sh
-sed -i "s|__REFLECTOR_COUNTRIES__|${REFLECTOR_COUNTRIES}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__CONSOLE_KEYMAP__|${CONSOLE_KEYMAP}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__SWAP_SIZE_MIB__|${SWAP_SIZE_MIB}|g" /mnt/root/chroot-setup.sh
 
@@ -2141,7 +2182,7 @@ UWSM_ENV_HYPR_EOF
 cat <<'HYPRLUA_EOF' > "$CFG/hypr/hyprland.lua"
 -- ~/.config/hypr/hyprland.lua — Hyprland 0.56+ Lua config
 -- Godot game dev + web dev, integrated Radeon, battery-priority.
--- Palette: Catppuccin Macchiato (https://catppuccin.com).
+-- Palette: Catppuccin Frappé (https://catppuccin.com).
 
 ----------------------------------------------------------------- programs
 -- This session is started by uwsm, so the compositor itself is
@@ -2193,10 +2234,10 @@ hl.config({
         border_size = 2,
 
         col = {
-            -- Macchiato blue -> mauve
-            active_border   = { colors = { "rgba(8aadf4ff)", "rgba(c6a0f6ff)" }, angle = 45 },
-            -- Macchiato surface1
-            inactive_border = "rgba(494d64aa)",
+            -- Frappé teal -> flamingo -> maroon, echoing the wallpaper
+            active_border   = { colors = { "rgba(81c8beff)", "rgba(eebebeff)", "rgba(ea999cff)" }, angle = 45 },
+            -- Frappé surface1
+            inactive_border = "rgba(51576daa)",
         },
 
         resize_on_border = true,
@@ -2224,8 +2265,8 @@ hl.config({
         disable_hyprland_logo    = true,
         disable_splash_rendering = true,
         force_default_wallpaper  = 0,
-        -- Macchiato base, shown where no window is
-        background_color         = 0xff24273a,
+        -- Frappé base, shown where no window is
+        background_color         = 0xff303446,
     },
 
     input = {
@@ -2379,7 +2420,7 @@ listener {
 HYPRIDLE_EOF
 
 cat <<'HYPRLOCK_EOF' > "$CFG/hypr/hyprlock.conf"
-# Catppuccin Macchiato
+# Catppuccin Frappé — teal/flamingo/maroon ring matches hyprland
 $font = JetBrainsMono Nerd Font
 
 general {
@@ -2388,7 +2429,7 @@ general {
 
 background {
     monitor =
-    color = rgba(24273aff)
+    color = rgba(303446ff)
 }
 
 input-field {
@@ -2397,11 +2438,11 @@ input-field {
     outline_thickness = 2
     rounding = 8
 
-    inner_color = rgba(363a4fff)
-    font_color  = rgba(cad3f5ff)
-    outer_color = rgba(8aadf4ff) rgba(c6a0f6ff) 45deg
-    check_color = rgba(eed49fff)
-    fail_color  = rgba(ed8796ff)
+    inner_color = rgba(414559ff)
+    font_color  = rgba(c6d0f5ff)
+    outer_color = rgba(81c8beff) rgba(eebebeff) rgba(ea999cff) 45deg
+    check_color = rgba(e5c890ff)
+    fail_color  = rgba(e78284ff)
 
     font_family = $font
     placeholder_text = <i>Password...</i>
@@ -2415,7 +2456,7 @@ input-field {
 label {
     monitor =
     text = $TIME
-    color = rgba(cad3f5ff)
+    color = rgba(c6d0f5ff)
     font_size = 64
     font_family = $font
 
@@ -2438,38 +2479,38 @@ blink=no
 [mouse]
 hide-when-typing=yes
 
-# Catppuccin Macchiato
+# Catppuccin Frappé
 # foot >= 1.17 split the old [colors] section into [colors-dark] and
 # [colors-light] and rejects the old name outright; dark is the default theme.
 [colors-dark]
 alpha=1.0
-foreground=cad3f5
-background=24273a
+foreground=c6d0f5
+background=303446
 
-regular0=494d64
-regular1=ed8796
-regular2=a6da95
-regular3=eed49f
-regular4=8aadf4
-regular5=f5bde6
-regular6=8bd5ca
-regular7=b8c0e0
+regular0=51576d
+regular1=e78284
+regular2=a6d189
+regular3=e5c890
+regular4=8caaee
+regular5=f4b8e4
+regular6=81c8be
+regular7=b5bfe2
 
-bright0=5b6078
-bright1=ed8796
-bright2=a6da95
-bright3=eed49f
-bright4=8aadf4
-bright5=f5bde6
-bright6=8bd5ca
-bright7=a5adcb
+bright0=626880
+bright1=e78284
+bright2=a6d189
+bright3=e5c890
+bright4=8caaee
+bright5=f4b8e4
+bright6=81c8be
+bright7=a5adce
 
-selection-foreground=cad3f5
-selection-background=494d64
-search-box-no-match=181926 ed8796
-search-box-match=cad3f5 363a4f
-jump-labels=181926 f5a97f
-urls=8aadf4
+selection-foreground=c6d0f5
+selection-background=51576d
+search-box-no-match=232634 e78284
+search-box-match=c6d0f5 414559
+jump-labels=232634 ef9f76
+urls=8caaee
 FOOT_EOF
 
 # ------------------------------------------------------------------ fuzzel
@@ -2496,19 +2537,19 @@ vertical-pad=12
 lines=12
 width=42
 
-# Catppuccin Macchiato
+# Catppuccin Frappé — teal accent to match the wallpaper
 [colors]
-background=24273aff
-text=cad3f5ff
-prompt=b8c0e0ff
-placeholder=8087a2ff
-input=cad3f5ff
-match=8aadf4ff
-selection=494d64ff
-selection-text=cad3f5ff
-selection-match=8aadf4ff
-counter=8087a2ff
-border=b7bdf8ff
+background=303446ff
+text=c6d0f5ff
+prompt=b5bfe2ff
+placeholder=838ba7ff
+input=c6d0f5ff
+match=81c8beff
+selection=51576dff
+selection-text=c6d0f5ff
+selection-match=81c8beff
+counter=838ba7ff
+border=babbf1ff
 
 [border]
 width=2
@@ -2518,7 +2559,7 @@ FUZZEL_EOF
 # ------------------------------------------------------------------ ashell
 cat <<'ASHELL_EOF' > "$CFG/ashell/config.toml"
 # ashell — status bar AND notification daemon (org.freedesktop.Notifications).
-# Palette: Catppuccin Macchiato.
+# Palette: Catppuccin Frappé, teal/flamingo/maroon accents echo the wallpaper.
 position = "Top"
 
 [modules]
@@ -2577,12 +2618,12 @@ battery_format = "IconAndPercentage"
 
 [appearance]
 font_name = "JetBrainsMono Nerd Font"
-primary_color = "#8aadf4"
-success_color = "#a6da95"
-warning_color = "#eed49f"
-danger_color  = "#ed8796"
-text_color    = "#cad3f5"
-workspace_colors = [ "#8aadf4", "#c6a0f6" ]
+primary_color = "#81c8be"
+success_color = "#a6d189"
+warning_color = "#e5c890"
+danger_color  = "#e78284"
+text_color    = "#c6d0f5"
+workspace_colors = [ "#81c8be", "#eebebe" ]
 
 [appearance.bar]
 surface = "solid"
@@ -2590,16 +2631,16 @@ radius = "md"
 margin = "xs"
 
 [appearance.background_color]
-base   = "#24273a"
-weak   = "#363a4f"
-strong = "#494d64"
-text   = "#cad3f5"
+base   = "#303446"
+weak   = "#414559"
+strong = "#51576d"
+text   = "#c6d0f5"
 ASHELL_EOF
 
 # -------------------------------------------------------------------- yazi
 cat <<'YAZI_THEME_EOF' > "$CFG/yazi/theme.toml"
 [flavor]
-dark = "catppuccin-macchiato"
+dark = "catppuccin-frappe"
 YAZI_THEME_EOF
 
 # ---------------------------------------------------------------- wallpaper
@@ -2628,10 +2669,10 @@ fi
 
 arch-chroot /mnt chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
 
-echo "==> Step 11: Fetching the Catppuccin Macchiato flavor for yazi"
-if ! arch-chroot /mnt runuser -l "$USERNAME" -c 'ya pkg add yazi-rs/flavors:catppuccin-macchiato'; then
+echo "==> Step 11: Fetching the Catppuccin Frappé flavor for yazi"
+if ! arch-chroot /mnt runuser -l "$USERNAME" -c 'ya pkg add yazi-rs/flavors:catppuccin-frappe'; then
     echo "  !! flavor fetch failed — yazi falls back to its default theme."
-    echo "     Re-run after first boot: ya pkg add yazi-rs/flavors:catppuccin-macchiato"
+    echo "     Re-run after first boot: ya pkg add yazi-rs/flavors:catppuccin-frappe"
 fi
 
 echo "==> Step 12: Handing DNS over to systemd-resolved"
@@ -2723,7 +2764,13 @@ echo "     XCursor builds, merged into one /usr/share/icons directory) and named
 echo "     in ~/.config/uwsm/env{,-hyprland}. If that fetch failed at install"
 echo "     time you'll see a warning above with the exact commands to redo it."
 echo ""
-echo " 10. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
+echo " 10. Login screen: ly plays github.com/lsfnts/PlatziInventory's"
+echo "     animation.dur as a durdraw animation (set via animation = dur_file"
+echo "     and dur_file_path in /etc/ly/config.ini). If that fetch failed at"
+echo "     install time you'll see a warning above with the command to redo it;"
+echo "     the greeter still works, just static, with animation = none."
+echo ""
+echo " 11. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
 echo "     The installer ran 'loadkeys $CONSOLE_KEYMAP' before asking for the"
 echo "     LUKS passphrase, and booster carries the same keymap into the initrd,"
 echo "     so the boot prompt and this session agree on where the symbols are."
