@@ -324,8 +324,8 @@ mount --mkdir -o fmask=0077,dmask=0077 "$EFI_PART" /mnt/boot
 echo "==> Step 4: Base install (pacstrap)"
 # Rank the LIVE environment's mirrors before pacstrap ever reads them, with
 # the exact settings the "Maintenance" step below later bakes into the
-# installed system's own reflector.conf/timer —  https, the 12
-# freshest, sorted by rate. pacstrap fetches every package through the ISO's
+# installed system's own reflector.conf/timer — https, the 12 freshest
+# by age, sorted by rate. pacstrap fetches every package through the ISO's
 # pacman/mirrorlist, so this is what actually speeds pacstrap up; reflector
 # is on the ISO by default, but nothing forces that, so check first.
 if command -v reflector >/dev/null 2>&1; then
@@ -341,7 +341,7 @@ fi
 # own package list further down: that script's shebang is #!/bin/dash, so
 # dash must already exist in /mnt the moment arch-chroot execs it — one step
 # too late to install it from inside the very script that needs it to start.
-pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu  linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools e2fsprogs micro dash
+pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu  linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools e2fsprogs micro dash wireless-regbd
 
 echo "==> Step 5: fstab + resolv.conf for network inside chroot"
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -565,6 +565,12 @@ echo "  -> Installing remaining packages"
 # that name with fc-match while building the initramfs. fc-match always
 # answers with *something*, so without the package the LUKS passphrase prompt
 # would quietly render in Noto instead of what the theme was drawn against.
+#
+# zstd (the CLI, not libarchive's built-in support) is for psf-cozette further
+# down: its PKGBUILD shells out to `zstd` in build(), and its packaged fonts
+# ship .psfu.zst — booster and kbd's own file lookup only ever try a name
+# raw or gzip-compressed, never zstd, so that AUR step recompresses the HiDPI
+# font to .gz once it lands.
 pacman -Syu --noconfirm --needed \
     opendoas base-devel git tealdeer dash \
     cryptsetup sbctl systemd-ukify sbsigntools efibootmgr openssl tpm2-tss tpm2-tools \
@@ -578,7 +584,7 @@ pacman -Syu --noconfirm --needed \
     cliphist wl-clipboard grim slurp brightnessctl playerctl pulsemixer \
     ffmpegthumbnailer 7zip jq poppler fd ripgrep fzf zoxide imagemagick \
     otf-monaspace-nerd noto-fonts noto-fonts-emoji cantarell-fonts \
-    reflector pacman-contrib \
+    reflector pacman-contrib zstd \
     vulkan-tools scx-scheds scx-tools
 
 
@@ -1820,13 +1826,56 @@ PORTALS_EOF
         echo "     dialogs will not open until it is there:"
         echo "       paru -S xdg-desktop-portal-termfilechooser"
     fi
+
+    echo "  -> Installing psf-cozette via paru (HiDPI console font)"
+    if runuser -l __USERNAME__ -c 'paru -S --noconfirm --needed psf-cozette'; then
+        echo "  -> psf-cozette installed"
+        # It ships /usr/share/kbd/consolefonts/cozette{6x13,12x26}.psfu.zst
+        # only. Neither booster (generator/console.go's findKbdFile) nor kbd's
+        # own runtime lookup ever tries a zstd-compressed variant — both only
+        # try a name raw or gzip-compressed — so the HiDPI font is invisible
+        # to either until a plain, uncompressed copy exists alongside it.
+        # Derived here rather than shipped upstream, so it stays in sync with
+        # whatever the AUR package's .zst updates to.
+        COZETTE_HD=/usr/share/kbd/consolefonts/cozette12x26.psfu
+        if zstd -dc "${COZETTE_HD}.zst" > "$COZETTE_HD"; then
+            sed -i '/^FONT=/d' /etc/vconsole.conf
+            echo 'FONT=cozette12x26' >> /etc/vconsole.conf
+            grep -q '^FONT=cozette12x26$' /etc/vconsole.conf || {
+                echo "  !! /etc/vconsole.conf did not take the font edit. Add"
+                echo "     'FONT=cozette12x26' to it by hand."
+            }
+            # The UKI built back in the initramfs step predates this font
+            # ('vconsole: true' in booster.yaml embeds it) — rebuild now so
+            # the very first boot's console renders in it, not just the next
+            # kernel upgrade.
+            if kernel-install add-all; then
+                echo "  -> UKI rebuilt with the HiDPI console font"
+            else
+                echo "  !! kernel-install add-all failed after setting the console"
+                echo "     font. Re-run it by hand before rebooting:"
+                echo "       doas kernel-install add-all"
+            fi
+        else
+            echo "  !! Could not decompress psf-cozette's HiDPI .zst — leaving"
+            echo "     /etc/vconsole.conf without a FONT= line."
+        fi
+    else
+        echo "  !! psf-cozette install FAILED. Console stays on the kernel's"
+        echo "     built-in font. Install it later with:  paru -S psf-cozette"
+        echo "     then:"
+        echo "       zstd -dc /usr/share/kbd/consolefonts/cozette12x26.psfu.zst \\"
+        echo "           > /usr/share/kbd/consolefonts/cozette12x26.psfu"
+        echo "     add 'FONT=cozette12x26' to /etc/vconsole.conf, and run"
+        echo "       doas kernel-install add-all"
+    fi
 else
     echo "  !! paru build FAILED, so NONE of the AUR packages were installed."
     echo "     The configs are still deployed; after first boot build paru with:"
     echo "       git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si"
-    echo "     then install all five with:"
+    echo "     then install all six with:"
     echo "       paru -S pacman-hook-kernel-install runapp ashell zen-browser-bin \\"
-    echo "               xdg-desktop-portal-termfilechooser"
+    echo "               xdg-desktop-portal-termfilechooser psf-cozette"
 fi
 echo 'permit persist :wheel' > /etc/doas.conf
 chmod 0400 /etc/doas.conf
@@ -2706,8 +2755,9 @@ echo "=================================================================="
 echo "  Install complete. Before you reboot, note the manual follow-ups:"
 echo "=================================================================="
 echo "  1. paru (AUR helper) is installed and was used to install runapp, ashell,"
-echo "     zen-browser-bin and pacman-hook-kernel-install (which rebuilds the"
-echo "     signed UKI on future kernel upgrades). For other AUR packages:"
+echo "     zen-browser-bin, psf-cozette and pacman-hook-kernel-install (which"
+echo "     rebuilds the signed UKI on future kernel upgrades). For other AUR"
+echo "     packages:"
 echo "       paru -S <pkg>"
 echo ""
 echo "  2. CPU scheduler: scx_loader is enabled and starts scx_lavd in Auto mode"
@@ -2770,7 +2820,14 @@ echo "     and dur_file_path in /etc/ly/config.ini). If that fetch failed at"
 echo "     install time you'll see a warning above with the command to redo it;"
 echo "     the greeter still works, just static, with animation = none."
 echo ""
-echo " 11. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
+echo " 11. Console font: psf-cozette's HiDPI variant (cozette12x26, from its"
+echo "     .psfu.zst decompressed to a plain .psfu — see the install step for"
+echo "     why) is set via FONT= in /etc/vconsole.conf and baked into the UKI,"
+echo "     so the LUKS prompt and every rescue tty render in it too. If the AUR"
+echo "     build failed you'll see a warning above with the exact commands to"
+echo "     add it by hand."
+echo ""
+echo " 12. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
 echo "     The installer ran 'loadkeys $CONSOLE_KEYMAP' before asking for the"
 echo "     LUKS passphrase, and booster carries the same keymap into the initrd,"
 echo "     so the boot prompt and this session agree on where the symbols are."
