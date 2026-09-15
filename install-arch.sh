@@ -342,7 +342,7 @@ fi
 # own package list further down: that script's shebang is #!/bin/dash, so
 # dash must already exist in /mnt the moment arch-chroot execs it — one step
 # too late to install it from inside the very script that needs it to start.
-pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu  linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools e2fsprogs micro dash wireless-regbd
+pacstrap -K /mnt base linux booster cryptsetup linux-firmware-amdgpu  linux-firmware-realtek linux-firmware-other amd-ucode f2fs-tools e2fsprogs micro dash wireless-regdb
 
 echo "==> Step 5: fstab + resolv.conf for network inside chroot"
 genfstab -U /mnt >> /mnt/etc/fstab
