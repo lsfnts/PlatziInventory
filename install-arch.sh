@@ -12,7 +12,8 @@
 # reflector/paccache/fstrim maintenance. No GTK anywhere: no GTK theme either.
 #
 # Desktop: foot (terminal) · fuzzel (launcher) · ashell (status bar AND
-# notification daemon) · yazi (file manager) · Catppuccin Frappé everywhere.
+# notification daemon) · yazi (file manager) · one theme.conf for the color
+# theme everywhere (Catppuccin Frappé by default).
 # The session is a set of systemd user units, not a process tree: uwsm starts
 # the compositor and its daemons, runapp starts applications into
 # app-graphical.slice, and systemd-oomd kills one of those instead of the
@@ -2199,7 +2200,226 @@ arch-chroot /mnt /root/chroot-setup.sh
 
 echo "==> Step 10: Deploying desktop configs for $USERNAME"
 CFG="/mnt/home/${USERNAME}/.config"
-mkdir -p "$CFG"/{hypr,uwsm,foot,fuzzel,ashell,yazi}
+mkdir -p "$CFG"/{hypr,uwsm,foot,fuzzel,ashell,yazi,theme}
+
+# ------------------------------------------------------------------- theme
+# The single file that actually defines the color theme. Every app below
+# except yazi (see its theme.toml) has its color settings generated FROM
+# these values by apply-theme, not hand-typed per app — change the theme by
+# editing this file and running:
+#   apply-theme
+# Its names are generic UI roles (BG, SURFACE_1, RED, ACCENT_2, ...), not
+# tied to Catppuccin or any other scheme — this install ships it filled in
+# with Catppuccin Frappé's values, but a Nord, Gruvbox, Dracula, or entirely
+# made-up palette works exactly the same way as long as it fills in the same
+# names. The role each name plays (which one is the border gradient, which
+# is the danger color, ...) is apply-theme's job, not this file's: that
+# keeps this file swappable without also having to know what every app does
+# with it. A handful of names (SKY, AZURE, VIOLET, BLUSH, and the middle
+# tier of each background/surface/overlay ramp) aren't read by anything
+# below yet — they're kept filled in anyway so a color is already there the
+# day something needs one, instead of a gap to notice and fill in first.
+cat > "$CFG/theme/theme.conf" <<'THEME_EOF'
+# Generic color-role names, not a specific color scheme's own vocabulary —
+# see the comment above this file's own generation for why. Filled in below
+# with Catppuccin Frappé (https://catppuccin.com/palette), this install's
+# shipped default.
+
+# Backgrounds, darkest to lightest
+BG_DARK=232634
+BG_DIM=292c3c
+BG=303446
+
+# Raised surfaces, darkest to lightest (panels, input fields, selections)
+SURFACE_0=414559
+SURFACE_1=51576d
+SURFACE_2=626880
+
+# Muted UI elements, darkest to lightest (placeholders, counters, hints)
+OVERLAY_0=737994
+OVERLAY_1=838ba7
+OVERLAY_2=949cbb
+
+# Foreground text: full contrast, then two increasingly muted tiers
+TEXT=c6d0f5
+TEXT_MUTED_1=b5bfe2
+TEXT_MUTED_2=a5adce
+
+# The eight hues every app below actually needs — foot's terminal palette
+# doubles as the danger/success/warning/link colors used elsewhere — plus
+# four more (SKY, AZURE, VIOLET, BLUSH) no app config reads yet. Nothing
+# currently generated breaks if these four are missing, but they're kept
+# filled in so a future app, or a future role added to apply-theme, has a
+# paler/secondary tint of blue, purple and pink already sitting here instead
+# of a hole to notice and fill in later.
+RED=e78284
+ORANGE=ef9f76
+YELLOW=e5c890
+GREEN=a6d189
+CYAN=81c8be
+SKY=99d1db
+AZURE=85c1dc
+BLUE=8caaee
+PURPLE=babbf1
+VIOLET=ca9ee6
+MAGENTA=f4b8e4
+BLUSH=f2d5cf
+
+# Two more accents used only as the 2nd and 3rd stops of the hyprland/
+# hyprlock border gradient (CYAN above is the 1st stop) — a free aesthetic
+# choice with no other role, so named by position instead of a hue
+ACCENT_2=eebebe
+ACCENT_3=ea999c
+THEME_EOF
+
+# apply-theme itself: dash, matching every other utility script in this
+# install, and safe to re-run any number of times (it edits by KEY, never by
+# matching the old color value, so a second run after a real theme change
+# still finds every line). It lives in /usr/local/bin, not ~/.local/bin,
+# because nothing here adds the latter to $PATH.
+cat > /mnt/usr/local/bin/apply-theme <<'APPLYTHEME_EOF'
+#!/bin/dash
+# apply-theme — regenerate every themed app's colors from
+# ~/.config/theme/theme.conf, the one file that actually defines the theme.
+#
+# Only the color-bearing lines in each config are touched, matched by key —
+# never by the old color value — so editing theme.conf to a different
+# palette and re-running this is safe any number of times. Everything else
+# in these files (font size, keybinds, ashell's non-color settings, ...) is
+# never touched here and stays safe to hand-edit permanently.
+#
+# hyprland.lua has no color lines to patch: it dofile()s colors.lua and
+# builds its own border/background values from the names in it, so
+# regenerating that one small file is enough. Reload with:
+#   hyprctl reload
+#
+# yazi is the one app NOT driven by this file: its colors come from the
+# upstream yazi-rs/flavors package named in ~/.config/yazi/theme.toml
+# (`ya pkg add yazi-rs/flavors:<flavor>`) — see the comment there.
+set -eu
+
+THEME_CONF="$HOME/.config/theme/theme.conf"
+if [ ! -f "$THEME_CONF" ]; then
+    echo "apply-theme: $THEME_CONF not found." >&2
+    exit 1
+fi
+. "$THEME_CONF"
+
+for v in BG_DARK BG_DIM BG SURFACE_0 SURFACE_1 SURFACE_2 OVERLAY_0 OVERLAY_1 \
+         OVERLAY_2 TEXT TEXT_MUTED_1 TEXT_MUTED_2 RED ORANGE YELLOW GREEN \
+         CYAN BLUE PURPLE MAGENTA ACCENT_2 ACCENT_3; do
+    eval "val=\${$v:-}"
+    if [ -z "$val" ]; then
+        echo "apply-theme: $THEME_CONF is missing $v" >&2
+        exit 1
+    fi
+done
+
+HYPR="$HOME/.config/hypr"
+mkdir -p "$HYPR"
+
+echo "-> hyprland (colors.lua)"
+cat > "$HYPR/colors.lua" <<LUA_EOF
+-- Generated by apply-theme from ~/.config/theme/theme.conf. Do not hand-edit;
+-- hyprland.lua dofile()s this for its border and background colors.
+return {
+    bg        = "$BG",
+    surface_1 = "$SURFACE_1",
+    text      = "$TEXT",
+    cyan      = "$CYAN",
+    accent_2  = "$ACCENT_2",
+    accent_3  = "$ACCENT_3",
+}
+LUA_EOF
+
+echo "-> hyprlock"
+HL="$HYPR/hyprlock.conf"
+if [ -f "$HL" ]; then
+    sed -i \
+        -e "/^background {/,/^}/ s|^\([[:space:]]*\)color = rgba(.*)|\1color = rgba(${BG}ff)|" \
+        -e "/^label {/,/^}/ s|^\([[:space:]]*\)color = rgba(.*)|\1color = rgba(${TEXT}ff)|" \
+        -e "s|^\([[:space:]]*\)inner_color = .*|\1inner_color = rgba(${SURFACE_0}ff)|" \
+        -e "s|^\([[:space:]]*\)font_color[[:space:]]*= .*|\1font_color  = rgba(${TEXT}ff)|" \
+        -e "s|^\([[:space:]]*\)outer_color = .*|\1outer_color = rgba(${CYAN}ff) rgba(${ACCENT_2}ff) rgba(${ACCENT_3}ff) 45deg|" \
+        -e "s|^\([[:space:]]*\)check_color = .*|\1check_color = rgba(${YELLOW}ff)|" \
+        -e "s|^\([[:space:]]*\)fail_color[[:space:]]*= .*|\1fail_color  = rgba(${RED}ff)|" \
+        "$HL"
+fi
+
+echo "-> foot"
+FT="$HOME/.config/foot/foot.ini"
+if [ -f "$FT" ]; then
+    sed -i \
+        -e "s|^foreground=.*|foreground=${TEXT}|" \
+        -e "s|^background=.*|background=${BG}|" \
+        -e "s|^regular0=.*|regular0=${SURFACE_1}|" \
+        -e "s|^regular1=.*|regular1=${RED}|" \
+        -e "s|^regular2=.*|regular2=${GREEN}|" \
+        -e "s|^regular3=.*|regular3=${YELLOW}|" \
+        -e "s|^regular4=.*|regular4=${BLUE}|" \
+        -e "s|^regular5=.*|regular5=${MAGENTA}|" \
+        -e "s|^regular6=.*|regular6=${CYAN}|" \
+        -e "s|^regular7=.*|regular7=${TEXT_MUTED_1}|" \
+        -e "s|^bright0=.*|bright0=${SURFACE_2}|" \
+        -e "s|^bright1=.*|bright1=${RED}|" \
+        -e "s|^bright2=.*|bright2=${GREEN}|" \
+        -e "s|^bright3=.*|bright3=${YELLOW}|" \
+        -e "s|^bright4=.*|bright4=${BLUE}|" \
+        -e "s|^bright5=.*|bright5=${MAGENTA}|" \
+        -e "s|^bright6=.*|bright6=${CYAN}|" \
+        -e "s|^bright7=.*|bright7=${TEXT_MUTED_2}|" \
+        -e "s|^selection-foreground=.*|selection-foreground=${TEXT}|" \
+        -e "s|^selection-background=.*|selection-background=${SURFACE_1}|" \
+        -e "s|^search-box-no-match=.*|search-box-no-match=${BG_DARK} ${RED}|" \
+        -e "s|^search-box-match=.*|search-box-match=${TEXT} ${SURFACE_0}|" \
+        -e "s|^jump-labels=.*|jump-labels=${BG_DARK} ${ORANGE}|" \
+        -e "s|^urls=.*|urls=${BLUE}|" \
+        "$FT"
+fi
+
+echo "-> fuzzel"
+FZ="$HOME/.config/fuzzel/fuzzel.ini"
+if [ -f "$FZ" ]; then
+    # Scoped to the [colors] section, not just anchored on the key: fuzzel's
+    # own top section has an UNRELATED "prompt=" (the literal prompt string,
+    # e.g. "❯ ") that a bare ^prompt= pattern would also match and clobber.
+    sed -i \
+        -e "/^\[colors\]/,/^\[border\]/ s|^background=.*|background=${BG}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^text=.*|text=${TEXT}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^prompt=.*|prompt=${TEXT_MUTED_1}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^placeholder=.*|placeholder=${OVERLAY_1}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^input=.*|input=${TEXT}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^match=.*|match=${CYAN}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^selection=.*|selection=${SURFACE_1}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^selection-text=.*|selection-text=${TEXT}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^selection-match=.*|selection-match=${CYAN}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^counter=.*|counter=${OVERLAY_1}ff|" \
+        -e "/^\[colors\]/,/^\[border\]/ s|^border=.*|border=${PURPLE}ff|" \
+        "$FZ"
+fi
+
+echo "-> ashell"
+AS="$HOME/.config/ashell/config.toml"
+if [ -f "$AS" ]; then
+    sed -i \
+        -e "s|^primary_color[[:space:]]*=.*|primary_color = \"#${CYAN}\"|" \
+        -e "s|^success_color[[:space:]]*=.*|success_color = \"#${GREEN}\"|" \
+        -e "s|^warning_color[[:space:]]*=.*|warning_color = \"#${YELLOW}\"|" \
+        -e "s|^danger_color[[:space:]]*=.*|danger_color  = \"#${RED}\"|" \
+        -e "s|^text_color[[:space:]]*=.*|text_color    = \"#${TEXT}\"|" \
+        -e "s|^workspace_colors[[:space:]]*=.*|workspace_colors = [ \"#${CYAN}\", \"#${ACCENT_2}\" ]|" \
+        -e "s|^base[[:space:]]*=.*|base   = \"#${BG}\"|" \
+        -e "s|^weak[[:space:]]*=.*|weak   = \"#${SURFACE_0}\"|" \
+        -e "s|^strong[[:space:]]*=.*|strong = \"#${SURFACE_1}\"|" \
+        -e "s|^text[[:space:]]*=.*|text   = \"#${TEXT}\"|" \
+        "$AS"
+fi
+
+echo "Theme applied. Restart ashell to pick it up (hyprctl and new"
+echo "foot/fuzzel/hyprlock instances already will):"
+echo "  systemctl --user restart ashell.service"
+APPLYTHEME_EOF
+chmod 755 /mnt/usr/local/bin/apply-theme
 
 # -------------------------------------------------------------------- uwsm
 # uwsm sources these with a shell and pushes the result into the systemd user
@@ -2231,7 +2451,13 @@ UWSM_ENV_HYPR_EOF
 cat <<'HYPRLUA_EOF' > "$CFG/hypr/hyprland.lua"
 -- ~/.config/hypr/hyprland.lua — Hyprland 0.56+ Lua config
 -- Godot game dev + web dev, integrated Radeon, battery-priority.
--- Palette: Catppuccin Frappé (https://catppuccin.com).
+-- Palette: whatever ~/.config/theme/theme.conf holds (Catppuccin Frappé by
+-- default), generated by apply-theme into colors.lua — see that file's own
+-- comment before hand-editing either the theme or the four lines below
+-- that use it. Named `palette`, not `colors`: Hyprland's own gradient
+-- tables use a field literally called `colors` a few lines down,
+-- and the two would be easy to mix up on a skim otherwise.
+local palette = dofile(os.getenv("HOME") .. "/.config/hypr/colors.lua")
 
 ----------------------------------------------------------------- programs
 -- This session is started by uwsm, so the compositor itself is
@@ -2283,10 +2509,9 @@ hl.config({
         border_size = 2,
 
         col = {
-            -- Frappé teal -> flamingo -> maroon, echoing the wallpaper
-            active_border   = { colors = { "rgba(81c8beff)", "rgba(eebebeff)", "rgba(ea999cff)" }, angle = 45 },
-            -- Frappé surface1
-            inactive_border = "rgba(51576daa)",
+            -- cyan -> accent_2 -> accent_3 (theme.conf), echoing the wallpaper
+            active_border   = { colors = { "rgba(" .. palette.cyan .. "ff)", "rgba(" .. palette.accent_2 .. "ff)", "rgba(" .. palette.accent_3 .. "ff)" }, angle = 45 },
+            inactive_border = "rgba(" .. palette.surface_1 .. "aa)",
         },
 
         resize_on_border = true,
@@ -2314,8 +2539,8 @@ hl.config({
         disable_hyprland_logo    = true,
         disable_splash_rendering = true,
         force_default_wallpaper  = 0,
-        -- Frappé base, shown where no window is
-        background_color         = 0xff303446,
+        -- shown where no window is
+        background_color         = tonumber("0xff" .. palette.bg),
     },
 
     input = {
@@ -2469,7 +2694,8 @@ listener {
 HYPRIDLE_EOF
 
 cat <<'HYPRLOCK_EOF' > "$CFG/hypr/hyprlock.conf"
-# Catppuccin Frappé — teal/flamingo/maroon ring matches hyprland
+# From ~/.config/theme/theme.conf via apply-theme — the ring's cyan/
+# accent_2/accent_3 match hyprland's border gradient
 $font = JetBrainsMono Nerd Font
 
 general {
@@ -2528,8 +2754,8 @@ blink=no
 [mouse]
 hide-when-typing=yes
 
-# Catppuccin Frappé
-# foot >= 1.17 split the old [colors] section into [colors-dark] and
+# From ~/.config/theme/theme.conf via apply-theme (Catppuccin Frappé by
+# default). foot >= 1.17 split the old [colors] section into [colors-dark] and
 # [colors-light] and rejects the old name outright; dark is the default theme.
 [colors-dark]
 alpha=1.0
@@ -2586,7 +2812,7 @@ vertical-pad=12
 lines=12
 width=42
 
-# Catppuccin Frappé — teal accent to match the wallpaper
+# From ~/.config/theme/theme.conf via apply-theme — cyan is the accent
 [colors]
 background=303446ff
 text=c6d0f5ff
@@ -2608,7 +2834,8 @@ FUZZEL_EOF
 # ------------------------------------------------------------------ ashell
 cat <<'ASHELL_EOF' > "$CFG/ashell/config.toml"
 # ashell — status bar AND notification daemon (org.freedesktop.Notifications).
-# Palette: Catppuccin Frappé, teal/flamingo/maroon accents echo the wallpaper.
+# Palette: whatever ~/.config/theme/theme.conf holds (Catppuccin Frappé by
+# default) via apply-theme; its cyan/accent_2/accent_3 echo the wallpaper.
 position = "Top"
 
 [modules]
@@ -2687,6 +2914,12 @@ text   = "#c6d0f5"
 ASHELL_EOF
 
 # -------------------------------------------------------------------- yazi
+# The one app apply-theme does NOT drive: yazi's colors come from the
+# upstream yazi-rs/flavors package named below (fetched in Step 11), not
+# from ~/.config/theme/theme.conf. Its colors happen to already be
+# Catppuccin Frappé, so it matches everything else today, but switching this
+# install's theme means also changing this flavor name and its `ya pkg add`
+# line — apply-theme has no way to regenerate a yazi flavor package itself.
 cat <<'YAZI_THEME_EOF' > "$CFG/yazi/theme.toml"
 [flavor]
 dark = "catppuccin-frappe"
@@ -2717,6 +2950,11 @@ else
 fi
 
 arch-chroot /mnt chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+
+echo "  -> Generating hypr/colors.lua from theme.conf"
+# hyprland.lua dofile()s this; it does not exist until apply-theme has run
+# once, so this run is not just a check — first login needs it to be here.
+arch-chroot /mnt runuser -l "$USERNAME" -c 'apply-theme'
 
 echo "==> Step 11: Fetching the Catppuccin Frappé flavor for yazi"
 if ! arch-chroot /mnt runuser -l "$USERNAME" -c 'ya pkg add yazi-rs/flavors:catppuccin-frappe'; then
@@ -2820,14 +3058,21 @@ echo "     and dur_file_path in /etc/ly/config.ini). If that fetch failed at"
 echo "     install time you'll see a warning above with the command to redo it;"
 echo "     the greeter still works, just static, with animation = none."
 echo ""
-echo " 11. Console font: psf-cozette's HiDPI variant (cozette12x26, from its"
+echo " 11. Color theme: one file, ~/.config/theme/theme.conf, is the whole"
+echo "     palette for hyprland, hyprlock, foot, fuzzel and ashell. Its names"
+echo "     are generic UI roles, not Catppuccin-specific — Nord, Gruvbox,"
+echo "     Dracula or your own palette all work the same way. Edit it, then"
+echo "     run 'apply-theme' and 'hyprctl reload'. yazi is the one"
+echo "     exception: it reads its own upstream flavor package (theme.toml)."
+echo ""
+echo " 12. Console font: psf-cozette's HiDPI variant (cozette12x26, from its"
 echo "     .psfu.zst decompressed to a plain .psfu — see the install step for"
 echo "     why) is set via FONT= in /etc/vconsole.conf and baked into the UKI,"
 echo "     so the LUKS prompt and every rescue tty render in it too. If the AUR"
 echo "     build failed you'll see a warning above with the exact commands to"
 echo "     add it by hand."
 echo ""
-echo " 12. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
+echo " 13. Keyboard: console keymap '$CONSOLE_KEYMAP', Hyprland/xkb '$KB_LAYOUT'."
 echo "     The installer ran 'loadkeys $CONSOLE_KEYMAP' before asking for the"
 echo "     LUKS passphrase, and booster carries the same keymap into the initrd,"
 echo "     so the boot prompt and this session agree on where the symbols are."
