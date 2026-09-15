@@ -801,7 +801,11 @@ if swapon /swapfile; then
     # Not fatal, just honest: hibernation is best-effort below this line.
     MEM_TOTAL_MIB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
     if [ __SWAP_SIZE_MIB__ -lt "$MEM_TOTAL_MIB" ]; then
-        echo "    note: swap file is ${__SWAP_SIZE_MIB__} MiB and MemTotal is ${MEM_TOTAL_MIB} MiB."
+        # The placeholder goes in bare, never wrapped in shell expansion
+        # syntax: the outer script seds it to a plain number, so a brace form
+        # would become a reference to that numbered POSITIONAL PARAMETER,
+        # which set -u then kills with "NNNN: parameter not set".
+        echo "    note: swap file is __SWAP_SIZE_MIB__ MiB and MemTotal is ${MEM_TOTAL_MIB} MiB."
         echo "          Hibernation fits the compressed minimum image, not a full RAM dump."
     fi
 else
@@ -2086,16 +2090,12 @@ if [ "$SIGNED_POLICY" = yes ]; then
         echo "/etc/kernel/uki.conf, run 'doas kernel-install add-all', reboot, re-run this." >&2
         exit 1
     fi
-    systemd-cryptenroll --wipe-slot=0 "$LUKS_DEV"
-    systemd-cryptenroll --recovery-key "$LUKS_DEV"
     systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
         --tpm2-pcrs=7+15:sha256=0000000000000000000000000000000000000000000000000000000000000000 \
         --tpm2-public-key=/etc/kernel/pcr-public.pem --tpm2-public-key-pcrs=11 \
         --tpm2-signature="$PCRSIG" \
         "$LUKS_DEV"
 else
-    systemd-cryptenroll --wipe-slot=0 "$LUKS_DEV"
-    systemd-cryptenroll --recovery-key "$LUKS_DEV"
     systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
         --tpm2-pcrs=7+15:sha256=0000000000000000000000000000000000000000000000000000000000000000 \
         "$LUKS_DEV"
