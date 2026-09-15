@@ -174,11 +174,11 @@ esac
 
 # FAT32 needs >= 65525 clusters and a cluster is never smaller than a sector,
 # so 4 KiB sectors put the floor at 256 MiB of data area — 256M lands just
-# under it and mkfs.fat -F32 refuses, 288M clears it. (4Kn also needs
+# under it and mkfs.fat -F32 refuses, 260M clears it. (4Kn also needs
 # dosfstools >= 4.2; Arch ships that.)
 LBS="$(blockdev --getss "$DISK")"
 if [ "$LBS" -ge 4096 ]; then
-    EFI_SIZE="288M"
+    EFI_SIZE="260M"
 else
     EFI_SIZE="256M"
 fi
