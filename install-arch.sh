@@ -42,6 +42,11 @@ USERNAME="luis"
 TIMEZONE="America/El_Salvador"       # e.g. America/New_York — see /usr/share/zoneinfo
 LANG_LOCALE="en_US.UTF-8"     # display/message language
 REGIONAL_LOCALE="es_SV.UTF-8" # date/currency/number formatting (El Salvador)
+# Mirror countries, nearest-first is irrelevant (reflector sorts by score, not
+# distance) but the SET matters a lot — see the Maintenance step. Central
+# America has no Arch mirrors at all, so this is the real neighbourhood for
+# El Salvador. Widen it (add CA,BR,CL) only if the list ever comes up empty.
+REFLECTOR_COUNTRIES="US,MX"
 CONSOLE_KEYMAP="la-latin1"
 KB_LAYOUT="latam"
 # Hibernation swap file, in MiB. Not the primary swap device (zram is), so
@@ -324,15 +329,26 @@ mount --mkdir -o fmask=0077,dmask=0077 "$EFI_PART" /mnt/boot
 
 echo "==> Step 4: Base install (pacstrap)"
 # Rank the LIVE environment's mirrors before pacstrap ever reads them, with
-# the exact settings the "Maintenance" step below later bakes into the
-# installed system's own reflector.conf/timer — https, the 12 freshest
-# by age, sorted by rate. pacstrap fetches every package through the ISO's
-# pacman/mirrorlist, so this is what actually speeds pacstrap up; reflector
-# is on the ISO by default, but nothing forces that, so check first.
+# the same filters the "Maintenance" step below bakes into the installed
+# system's reflector.conf — see there for why each one is present. pacstrap
+# fetches every package through the ISO's pacman/mirrorlist, so this is what
+# actually speeds pacstrap up; reflector is on the ISO by default, but nothing
+# forces that, so check first.
 if command -v reflector >/dev/null 2>&1; then
-    reflector --age 12 --protocol https --latest 12 --sort rate \
+    reflector --protocol https --country "$REFLECTOR_COUNTRIES" \
+        --completion-percent 100 --age 12 --delay 1 \
+        --sort score --number 10 \
         --save /etc/pacman.d/mirrorlist \
         || echo "  !! reflector failed here — pacstrap falls back to the ISO's mirrorlist"
+    # reflector exits 0 after writing a header-only file when every mirror is
+    # filtered out, and pacstrap's failure mode for that is an unhelpful "no
+    # servers configured for repository". Catch it here instead.
+    if ! grep -q '^Server' /etc/pacman.d/mirrorlist; then
+        echo "  !! the filters matched NO mirrors — restoring the ISO's list." >&2
+        echo "     Widen REFLECTOR_COUNTRIES at the top of this script." >&2
+        pacman -Sy --noconfirm pacman-mirrorlist >/dev/null 2>&1 || true
+        cp /etc/pacman.d/mirrorlist.pacnew /etc/pacman.d/mirrorlist 2>/dev/null || true
+    fi
 else
     echo "  -> reflector not found on this ISO — pacstrap uses its shipped mirrorlist"
 fi
@@ -1708,17 +1724,54 @@ echo "  -> Maintenance"
 # The shipped reflector.conf is an ARGUMENT list, not key=value, and ships
 # commented out — the usual `sed s/^Country = .*/` matches nothing and the
 # timer then runs unfiltered. Write the file, don't patch it.
+#
+# --country is doing the geographic work, and it has to, because NONE of the
+# other filters know where this laptop is: MirrorStatus score/delay are global
+# measurements taken from Arch's own infrastructure. Without it, --latest N
+# picks the N freshest mirrors ON EARTH — in practice mostly European — and no
+# amount of sorting rescues a pool that is already on the wrong continent.
+# El Salvador has no mirrors of its own, and neither does anywhere else in
+# Central America, so US + MX is the real neighbourhood. (Colombia's two are
+# excluded automatically: neither is 100% synced.)
+#
+# --sort score, NOT --sort rate. A rate sort DOWNLOADS extra/os/x86_64/extra.db
+# — 8.9 MB as of writing — from every candidate, so the old `--latest 12 --sort
+# rate` cost ~107 MB on each run, weekly, whenever the timer happened to fire.
+# On a laptop that lives on cafe wifi that is the wrong trade twice over: it
+# spends someone else's bandwidth, and it measures the path from wherever the
+# machine happened to be that morning, which is not where it will be when the
+# next `pacman -Syu` runs. MirrorStatus score already folds completion, sync
+# delay and transfer-duration stddev into one number, costs one ~1 MB JSON
+# fetch, and — unlike a rate test — describes the mirror rather than the cafe.
+#
+# --delay 1: reported sync delay of an hour or less (the option takes HOURS;
+# the underlying field is seconds). --completion-percent 100 is already
+# reflector's default, written out so a future default change cannot quietly
+# let a half-synced mirror in. --number 10 leaves pacman nine fallbacks.
 mkdir -p /etc/xdg/reflector
 cat > /etc/xdg/reflector/reflector.conf <<REFLECTOR_EOF
 --save /etc/pacman.d/mirrorlist
 --protocol https
+--country __REFLECTOR_COUNTRIES__
+--completion-percent 100
 --age 12
---latest 12
---sort rate
+--delay 1
+--sort score
+--number 10
 REFLECTOR_EOF
-reflector --age 12 --protocol https --latest 12 --sort rate \
+reflector --protocol https --country __REFLECTOR_COUNTRIES__ \
+    --completion-percent 100 --age 12 --delay 1 \
+    --sort score --number 10 \
     --save /etc/pacman.d/mirrorlist \
     || echo "reflector failed — check network, you can re-run it after first boot"
+# Same header-only-file trap as on the live USB: reflector exits 0 having
+# written no Server lines if the filters match nothing.
+if ! grep -q '^Server' /etc/pacman.d/mirrorlist; then
+    echo "  !! reflector matched NO mirrors — leaving the mirrorlist as-is." >&2
+    echo "     After first boot, widen it and re-run:" >&2
+    echo "       doas reflector --protocol https --country US,MX,CA --age 24 \\" >&2
+    echo "            --sort score --number 10 --save /etc/pacman.d/mirrorlist" >&2
+fi
 systemctl enable reflector.timer
 systemctl enable paccache.timer
 systemctl enable fstrim.timer
@@ -2136,6 +2189,7 @@ sed -i "s|__USERNAME__|${USERNAME}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__ROOT_MOUNT_OPTS__|${ROOT_MOUNT_OPTS}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__LUKS_UUID__|${LUKS_UUID}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__ROOT_FS_UUID__|${ROOT_FS_UUID}|g" /mnt/root/chroot-setup.sh
+sed -i "s|__REFLECTOR_COUNTRIES__|${REFLECTOR_COUNTRIES}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__CONSOLE_KEYMAP__|${CONSOLE_KEYMAP}|g" /mnt/root/chroot-setup.sh
 sed -i "s|__SWAP_SIZE_MIB__|${SWAP_SIZE_MIB}|g" /mnt/root/chroot-setup.sh
 
