@@ -6,59 +6,61 @@
 # Reprogram the console's 16 hardware palette entries to the colors the login
 # animation was built against.
 #
-# Why this is needed: animation.dur is colorFormat "16", and config.ini sets
-# full_color = false, so DurFile.zig renders it through tb_color_16 -- a direct
-# lookup into whatever 16 colors this VT's palette currently holds, with no RGB
-# anywhere in the path. Left at the console default that lookup lands on stock
-# ANSI red/green/blue. These values are what the .dur cell indices actually mean.
+# animation.dur is colorFormat "16" and config.ini sets full_color = false, so
+# DurFile.zig renders it through tb_color_16 -- a direct index into whatever 16
+# colors this VT's palette holds, with no RGB anywhere in the path. If this
+# script does not run, the animation still draws perfectly but every index lands
+# on the stock ANSI palette: the teal ground comes out electric blue, petals come
+# out cyan and magenta. That is the failure mode to look for.
 #
-# Slots 0-7 are 8 colors k-means'd out of the artwork and sorted darkest ->
-# lightest; every cell's *background* is one of them, which is what paints the
-# picture. Slots 8-15 are the same 8 blended 45% toward white and are used as
-# each cell's *foreground*, so the 0/1 glyphs read as texture over their own
-# color. The split is forced, not stylistic: the Linux console reaches slots
-# 8-15 only via bold, and bold brightens the foreground only -- a background can
-# never be brighter than slot 7.
+# Slot 0 is every cell's background (the .dur stores bg = 0 for all of them), so
+# it covers most of the screen and is deliberately a dark neutral. Slots 1-15 are
+# 15 colors k-means'd out of the artwork, sorted darkest -> lightest, and carry
+# the picture as the 0/1 glyph colors. They are lifted well above their literal
+# values because a glyph inks only about a fifth of its cell and would otherwise
+# average out almost black against slot 0.
 #
 # Regenerate these together with the .dur file; the indices inside it are
 # meaningless against a different palette.
-if [ "$TERM" = "linux" ] || [ -w /dev/tty2 ]; then
-	BG_DARKEST="343c2e"      # 0  deep leaf green
-	BG_DARK="514f42"         # 1  shadowed foliage
-	BG_MID_WARM="676660"     # 2  olive gray
-	BG_MID="797e7c"          # 3  neutral gray
-	BG_TEAL="829895"         # 4  the painting's teal ground
-	BG_MAUVE="b18b90"        # 5  deep petal rose
-	BG_PINK="cdabae"         # 6  mid petal pink
-	BG_LIGHTEST="e9cbc6"     # 7  petal cream (also ly's "white" UI text)
+BACKGROUND="181917"   # 0   dark neutral ground (also ly's default bg)
+ROSE_DEEP="b95779"    # 1   \
+LEAF="768a69"         # 2    |
+OLIVE="939b65"        # 3    |
+SAGE="95a58a"         # 4    |
+MAUVE="d194a8"        # 5    |
+TEAL_DIM="9cafac"     # 6    |
+TAN="bab27e"          # 7    |  15 colors sampled from correct.png,
+TEAL="a9bdb9"         # 8    |  ordered darkest -> lightest
+PEACH="e9ac90"        # 9    |
+LILAC="dcb6cf"        # 10   |
+TEAL_PALE="adc9c6"    # 11   |
+AQUA="b0d0cc"         # 12   |
+PEARL="d1cbce"        # 13   |
+CREAM="f4cbb8"        # 14  /
+BLUSH="f0d6df"        # 15  lightest -- also ly's bold-white UI text
 
-	FG_DARKEST="8f948c"      # 8  slots 0-7, each blended 45% toward white
-	FG_DARK="9f9e97"         # 9
-	FG_MID_WARM="acaba7"     # 10
-	FG_MID="b5b8b7"          # 11
-	FG_TEAL="bac6c5"         # 12
-	FG_MAUVE="d4bfc2"        # 13
-	FG_PINK="e4d1d2"         # 14
-	FG_LIGHTEST="f3e2e0"     # 15
+COLORS="${BACKGROUND} ${ROSE_DEEP} ${LEAF} ${OLIVE} ${SAGE} ${MAUVE} ${TEAL_DIM} ${TAN} ${TEAL} ${PEACH} ${LILAC} ${TEAL_PALE} ${AQUA} ${PEARL} ${CREAM} ${BLUSH}"
 
-	COLORS="${BG_DARKEST} ${BG_DARK} ${BG_MID_WARM} ${BG_MID} ${BG_TEAL} ${BG_MAUVE} ${BG_PINK} ${BG_LIGHTEST} ${FG_DARKEST} ${FG_DARK} ${FG_MID_WARM} ${FG_MID} ${FG_TEAL} ${FG_MAUVE} ${FG_PINK} ${FG_LIGHTEST}"
+set_palette() {
+	i=0
+	while [ $i -lt 16 ]; do
+		printf "\033]P%x%s" ${i} "$(echo "$COLORS" | cut -d ' ' -f$(( i + 1)))"
 
-	set_palette() {
-		i=0
-		while [ $i -lt 16 ]; do
-			printf "\033]P%x%s" ${i} "$(echo "$COLORS" | cut -d ' ' -f$(( i + 1)))"
+		i=$(( i + 1 ))
+	done
 
-			i=$(( i + 1 ))
-		done
+	# Raw erase rather than `clear`: this runs before ly takes the TTY, where
+	# TERM may be unset and terminfo therefore unavailable. Fixes the background
+	# artifacting left behind by changing the palette.
+	printf "\033[H\033[2J"
+}
 
-		clear # for fixing background artifacting after changing color
-	}
+# Apply to both the VT ly is about to take and our own stdout, because which one
+# is the console depends on how ly was started. Setting the palette twice is
+# harmless; setting it nowhere is the bug that leaves the stock ANSI colors up.
+# Note there is deliberately no `[ "$TERM" = linux ]` guard here -- systemd does
+# not always export TERM to the unit, and that guard silently skips everything.
+[ -w /dev/tty2 ] && set_palette > /dev/tty2
+[ -t 1 ] && set_palette
 
-	# ly's start_cmd runs before it takes the TTY, so stdout is already the
-	# console when TERM says so; otherwise address ly@tty2's VT directly.
-	if [ "$TERM" = "linux" ]; then
-		set_palette
-	else
-		set_palette > /dev/tty2
-	fi
-fi
+exit 0
