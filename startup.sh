@@ -60,7 +60,7 @@ set_palette() {
 # harmless; setting it nowhere is the bug that leaves the stock ANSI colors up.
 # Note there is deliberately no `[ "$TERM" = linux ]` guard here -- systemd does
 # not always export TERM to the unit, and that guard silently skips everything.
-[ -w /dev/tty2 ] && set_palette > /dev/tty2
+[ -w /dev/tty1 ] && set_palette > /dev/tty1
 [ -t 1 ] && set_palette
 
 exit 0
